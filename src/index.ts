@@ -440,7 +440,15 @@ async function resolveDeepDiveTarget(env: Env, target: string): Promise<DeepDive
   if (!looksLikeWebsite && cleaned.startsWith("@")) {
     const igHandle = cleaned.slice(1).replace(/[^a-z0-9._]/gi, "");
     if (!igHandle) throw new Error("handle Instagram non valido");
-    return { ok: true, step: "resolve", completedAt, igHandle, displayName: igHandle };
+    const identity = await identifyInstagramTarget(env, igHandle);
+    return {
+      ok: true,
+      step: "resolve",
+      completedAt,
+      igHandle,
+      displayName: identity.displayName,
+      ...(identity.websiteUrl ? { websiteUrl: identity.websiteUrl } : {}),
+    };
   }
 
   try {
@@ -458,6 +466,33 @@ async function resolveDeepDiveTarget(env: Env, target: string): Promise<DeepDive
     };
   } catch {
     throw new Error("per ora usa un @handle Instagram oppure un URL completo");
+  }
+}
+
+async function identifyInstagramTarget(env: Env, igHandle: string): Promise<{ displayName: string; websiteUrl: string | null }> {
+  try {
+    const raw = await askClaudeWithWebSearch(
+      env,
+      `Cerca sul web il fotografo o brand associato al profilo Instagram @${igHandle}. Rispondi SOLO con JSON valido: {"displayName":"nome pubblico esatto","websiteUrl":"URL del sito ufficiale oppure null"}. Considera ufficiale solo un sito chiaramente associato allo stesso brand. Non inventare dati.`,
+    );
+    const identity = parseJsonRecord(raw);
+    const displayName = asString(identity?.displayName) ?? igHandle;
+    const websiteUrl = normalizeWebsiteUrl(asString(identity?.websiteUrl));
+    return { displayName, websiteUrl };
+  } catch (error) {
+    console.error("[FASE-2] Risoluzione Instagram fallita:", error);
+    return { displayName: igHandle, websiteUrl: null };
+  }
+}
+
+function normalizeWebsiteUrl(value: string | null): string | null {
+  if (!value) return null;
+  try {
+    const candidate = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+    const url = new URL(candidate);
+    return /^https?:$/.test(url.protocol) ? url.toString() : null;
+  } catch {
+    return null;
   }
 }
 
