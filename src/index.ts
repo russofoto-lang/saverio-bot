@@ -6,6 +6,7 @@ type KVNamespace = {
   get(key: string): Promise<string | null>;
   put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
   delete(key: string): Promise<void>;
+  list(options?: { prefix?: string; limit?: number }): Promise<{ keys: Array<{ name: string }> }>;
 };
 
 type ScheduledEvent = { cron: string };
@@ -40,6 +41,8 @@ const FIRESTORE_SCOPE = "https://www.googleapis.com/auth/datastore";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar";
 const GOOGLE_CALENDAR_ID = "primary";
+const DEEP_DIVE_JOB_TTL = 60 * 60 * 24;
+const DEEP_DIVE_STEPS = ["resolve", "instagram", "website", "web-mentions", "synthesize"] as const;
 
 let firestoreAccessToken: { token: string; expiresAt: number } | null = null;
 let googleCalendarAccessToken: { token: string; expiresAt: number } | null = null;
@@ -114,6 +117,23 @@ export default {
     }
     if (text === "/start") {
       await sendMessage(env, chatId, "Sono Saverio. Dimmi su cosa devi decidere.");
+      return new Response("ok");
+    }
+
+    const deepDiveTarget = getDeepDiveTarget(text);
+    if (deepDiveTarget !== null) {
+      if (!deepDiveTarget) {
+        await sendMessage(env, chatId, "Scrivimi cosa indagare, per esempio: /indaga @nomeprofilo");
+        return new Response("ok");
+      }
+
+      const job = await createDeepDiveJob(env, chatId, deepDiveTarget);
+      const reply = `Indagine su «${job.target}» avviata. Ti mando il report tra qualche minuto.`;
+      await appendHistory(env, chatId, [
+        { role: "user", content: text },
+        { role: "assistant", content: reply },
+      ]);
+      await sendMessage(env, chatId, reply);
       return new Response("ok");
     }
 
@@ -215,6 +235,11 @@ async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
       return;
     }
 
+    if (event.cron === "*/2 * * * *") {
+      await processNextDeepDiveJob(env);
+      return;
+    }
+
     if (event.cron === "25 5 * * *") {
       try {
         await fetch(env.TASK_URL + "/open", { method: "GET" });
@@ -236,6 +261,19 @@ async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
 };
 
 type Turn = { role: "user" | "assistant"; content: string };
+type DeepDiveStep = typeof DEEP_DIVE_STEPS[number];
+type DeepDiveJob = {
+  type: "deep-dive";
+  target: string;
+  chatId: number;
+  status: "pending" | "running" | "done" | "failed";
+  currentStep: number;
+  steps: DeepDiveStep[];
+  results: Partial<Record<DeepDiveStep, { ok: boolean; step: DeepDiveStep; completedAt: string }>>;
+  createdAt: string;
+  completedAt?: string;
+  error: string | null;
+};
 type LongMemory = {
   id: string;
   testo: string;
@@ -246,6 +284,99 @@ type LongMemory = {
 
 const historyKey = (chatId: number) => `hist:${chatId}`;
 const longMemoryKey = (chatId: number) => `long_memory:${chatId}`;
+const deepDiveJobKey = (id: string) => `job:${id}`;
+
+function getDeepDiveTarget(text: string): string | null {
+  const match = text.match(/^\/indaga(?:@\w+)?(?:\s+([\s\S]+))?$/i);
+  return match ? (match[1]?.trim() ?? "") : null;
+}
+
+async function createDeepDiveJob(env: Env, chatId: number, target: string): Promise<DeepDiveJob> {
+  const id = crypto.randomUUID();
+  const job: DeepDiveJob = {
+    type: "deep-dive",
+    target,
+    chatId,
+    status: "pending",
+    currentStep: 0,
+    steps: [...DEEP_DIVE_STEPS],
+    results: {},
+    createdAt: new Date().toISOString(),
+    error: null,
+  };
+  await env.SAVERIO_KV.put(deepDiveJobKey(id), JSON.stringify(job), { expirationTtl: DEEP_DIVE_JOB_TTL });
+  console.log(`[FASE-2] Job ${id} creato per ${target}.`);
+  return job;
+}
+
+async function processNextDeepDiveJob(env: Env): Promise<void> {
+  const jobs = await env.SAVERIO_KV.list({ prefix: "job:", limit: 100 });
+
+  for (const key of jobs.keys) {
+    const raw = await env.SAVERIO_KV.get(key.name);
+    if (!raw) continue;
+
+    let job: DeepDiveJob;
+    try {
+      job = JSON.parse(raw) as DeepDiveJob;
+    } catch (error) {
+      console.error(`[FASE-2] Job non leggibile ${key.name}:`, error);
+      continue;
+    }
+
+    if (job.type !== "deep-dive" || (job.status !== "pending" && job.status !== "running")) continue;
+    await runOneDeepDiveStep(env, key.name, job);
+    return;
+  }
+}
+
+async function runOneDeepDiveStep(env: Env, key: string, job: DeepDiveJob): Promise<void> {
+  const step = job.steps[job.currentStep];
+  if (!step) {
+    job.status = "done";
+    job.completedAt = new Date().toISOString();
+    await saveDeepDiveJob(env, key, job);
+    return;
+  }
+
+  try {
+    job.status = "running";
+    job.results[step] = await runDeepDivePlaceholderStep(step);
+    job.currentStep += 1;
+
+    if (job.currentStep === job.steps.length) {
+      job.status = "done";
+      job.completedAt = new Date().toISOString();
+    }
+
+    await saveDeepDiveJob(env, key, job);
+    console.log(`[FASE-2] ${job.target}: step ${step} completato.`);
+
+    if (job.status === "done") {
+      await sendMessage(env, job.chatId, formatDeepDiveCompletion(job));
+    }
+  } catch (error) {
+    job.status = "failed";
+    job.error = error instanceof Error ? error.message : String(error);
+    await saveDeepDiveJob(env, key, job);
+    console.error(`[FASE-2] ${job.target}: step ${step} fallito:`, error);
+    await sendMessage(env, job.chatId, `Indagine su «${job.target}» interrotta allo step ${step}.`);
+  }
+}
+
+async function runDeepDivePlaceholderStep(step: DeepDiveStep): Promise<{ ok: boolean; step: DeepDiveStep; completedAt: string }> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+  return { ok: true, step, completedAt: new Date().toISOString() };
+}
+
+async function saveDeepDiveJob(env: Env, key: string, job: DeepDiveJob): Promise<void> {
+  await env.SAVERIO_KV.put(key, JSON.stringify(job), { expirationTtl: DEEP_DIVE_JOB_TTL });
+}
+
+function formatDeepDiveCompletion(job: DeepDiveJob): string {
+  const steps = job.steps.map((step) => `✓ ${step}`).join("\n");
+  return `Indagine su «${job.target}» completata.\n\n${steps}\n\nLa coda funziona: ora possiamo sostituire gli step di prova con dati reali.`;
+}
 
 async function loadHistory(env: Env, chatId: number): Promise<Turn[]> {
   const raw = await env.SAVERIO_KV.get(historyKey(chatId));
