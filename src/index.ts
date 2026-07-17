@@ -46,6 +46,24 @@ const DEEP_DIVE_JOB_TTL = 60 * 60 * 24;
 const DEEP_DIVE_STEPS = ["resolve", "instagram", "website", "web-mentions", "synthesize"] as const;
 const APIFY_INSTAGRAM_POST_ACTOR = "apify~instagram-post-scraper";
 const DEEP_DIVE_POST_LIMIT = 30;
+const DEEP_DIVE_INPUT_TTL = 60 * 5;
+const MENU_INDAGA = "🔎 Indaga";
+const MENU_LAVORI = "📋 Lavori";
+const MENU_MEMORIA = "🧠 Memoria";
+const MENU_OGGI = "📅 Oggi";
+const MENU_NUOVO = "↩️ Nuova chat";
+const MENU_RESET = "🧹 Reset";
+const MENU_AIUTO = "❓ Aiuto";
+const MAIN_MENU = {
+  keyboard: [
+    [{ text: MENU_INDAGA }, { text: MENU_LAVORI }],
+    [{ text: MENU_MEMORIA }, { text: MENU_OGGI }],
+    [{ text: MENU_NUOVO }, { text: MENU_RESET }, { text: MENU_AIUTO }],
+  ],
+  resize_keyboard: true,
+  is_persistent: true,
+  input_field_placeholder: "Scrivi a Saverio...",
+};
 
 let firestoreAccessToken: { token: string; expiresAt: number } | null = null;
 let googleCalendarAccessToken: { token: string; expiresAt: number } | null = null;
@@ -99,10 +117,30 @@ export default {
 
     const chatId = msg.chat.id;
     const userId = msg.from.id;
-    const text = msg.text.trim();
+    let text = msg.text.trim();
 
     if (ALLOWED_USER_ID && userId !== ALLOWED_USER_ID) {
       await sendMessage(env, chatId, "Questo bot è privato.");
+      return new Response("ok");
+    }
+
+    if (text === MENU_INDAGA) {
+      await env.SAVERIO_KV.put(deepDiveInputKey(chatId), "1", { expirationTtl: DEEP_DIVE_INPUT_TTL });
+      await sendMessage(env, chatId, "Mandami l'@handle Instagram o l'URL del sito da analizzare.", { menu: true });
+      return new Response("ok");
+    }
+    if (text === MENU_AIUTO) {
+      await sendMessage(env, chatId, "Tocca un tasto oppure scrivimi normalmente. Per un concorrente: Indaga, poi @handle o URL.", { menu: true });
+      return new Response("ok");
+    }
+    if (text === MENU_MEMORIA) text = "/memoria";
+    if (text === MENU_LAVORI) text = "lavori aperti";
+    if (text === MENU_OGGI) text = "cosa devo fare oggi";
+    if (text === MENU_NUOVO) text = "/nuovo";
+    if (text === MENU_RESET) text = "/reset";
+
+    if (text === "/start") {
+      await sendMessage(env, chatId, "Sono Saverio. Dimmi su cosa devi decidere.", { menu: true });
       return new Response("ok");
     }
 
@@ -125,6 +163,7 @@ export default {
 
     const deepDiveTarget = getDeepDiveTarget(text);
     if (deepDiveTarget !== null) {
+      await env.SAVERIO_KV.delete(deepDiveInputKey(chatId));
       if (!deepDiveTarget) {
         await sendMessage(env, chatId, "Scrivimi cosa indagare, per esempio: /indaga @nomeprofilo");
         return new Response("ok");
@@ -137,6 +176,18 @@ export default {
         { role: "assistant", content: reply },
       ]);
       await sendMessage(env, chatId, reply);
+      return new Response("ok");
+    }
+
+    if (await env.SAVERIO_KV.get(deepDiveInputKey(chatId))) {
+      await env.SAVERIO_KV.delete(deepDiveInputKey(chatId));
+      const job = await createDeepDiveJob(env, chatId, text);
+      const reply = `Indagine su "${job.target}" avviata. Ti mando il report tra qualche minuto.`;
+      await appendHistory(env, chatId, [
+        { role: "user", content: text },
+        { role: "assistant", content: reply },
+      ]);
+      await sendMessage(env, chatId, reply, { menu: true });
       return new Response("ok");
     }
 
@@ -290,6 +341,7 @@ type LongMemory = {
 const historyKey = (chatId: number) => `hist:${chatId}`;
 const longMemoryKey = (chatId: number) => `long_memory:${chatId}`;
 const deepDiveJobKey = (id: string) => `job:${id}`;
+const deepDiveInputKey = (chatId: number) => `pending_indaga:${chatId}`;
 
 function getDeepDiveTarget(text: string): string | null {
   const match = text.match(/^\/indaga(?:@\w+)?(?:\s+([\s\S]+))?$/i);
@@ -702,14 +754,16 @@ async function askClaude(env: Env, history: Turn[], memories: LongMemory[]): Pro
     .join("\n")
     .trim() || "(nessuna risposta)";
 }
-async function sendMessage(env: Env, chatId: number, text: string) {
+async function sendMessage(env: Env, chatId: number, text: string, options: { menu?: boolean } = {}) {
   // Telegram taglia oltre 4096 caratteri: spezzo se serve.
   for (let i = 0; i < text.length; i += 4000) {
     try {
+      const body: Record<string, unknown> = { chat_id: chatId, text: text.slice(i, i + 4000) };
+      if (options.menu && i === 0) body.reply_markup = MAIN_MENU;
       const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, text: text.slice(i, i + 4000) }),
+        body: JSON.stringify(body),
       });
       if (!response.ok) throw new Error(`Telegram error: ${response.status}`);
     } catch (error) {
