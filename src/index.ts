@@ -424,6 +424,8 @@ async function runOneDeepDiveStep(env: Env, key: string, job: DeepDiveJob): Prom
 async function runDeepDiveStep(env: Env, job: DeepDiveJob, step: DeepDiveStep): Promise<DeepDiveStepResult> {
   if (step === "resolve") return resolveDeepDiveTarget(job.target);
   if (step === "instagram") return runInstagramDeepDive(env, job);
+  if (step === "website") return runWebsiteDeepDive(job);
+  if (step === "web-mentions") return runWebMentionsDeepDive(env, job);
   return runDeepDivePlaceholderStep(step);
 }
 
@@ -583,6 +585,157 @@ function firstNumber(record: RawRecord, keys: string[]): number | null {
   return null;
 }
 
+type WebsitePage = { url: string; title: string | null; textContent: string };
+
+async function runWebsiteDeepDive(job: DeepDiveJob): Promise<DeepDiveStepResult> {
+  const websiteUrl = job.results.resolve ? asString(job.results.resolve.websiteUrl) : null;
+  const completedAt = new Date().toISOString();
+  if (!websiteUrl) {
+    return { ok: true, step: "website", completedAt, skipped: true, note: "Nessun URL sito disponibile." };
+  }
+
+  const home = await fetchWebsitePage(websiteUrl);
+  if (!home) throw new Error("sito non raggiungibile o senza contenuto leggibile");
+
+  const links = extractRelevantWebsiteLinks(home.html, home.url);
+  const pages: WebsitePage[] = [{ url: home.url, title: extractHtmlTitle(home.html), textContent: htmlToText(home.html) }];
+  for (const link of links.slice(0, 5)) {
+    const page = await fetchWebsitePage(link);
+    if (!page) continue;
+    pages.push({ url: page.url, title: extractHtmlTitle(page.html), textContent: htmlToText(page.html) });
+  }
+
+  return { ok: true, step: "website", completedAt, websiteUrl, pages };
+}
+
+async function fetchWebsitePage(url: string): Promise<{ url: string; html: string } | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "user-agent": "Mozilla/5.0 (compatible; SaverioResearch/1.0)",
+        accept: "text/html,application/xhtml+xml",
+      },
+      signal: controller.signal,
+      redirect: "follow",
+    });
+    if (!response.ok || !response.headers.get("content-type")?.includes("text/html")) return null;
+    const html = await response.text();
+    return html ? { url: response.url, html } : null;
+  } catch (error) {
+    console.error("[FASE-2] Lettura sito fallita:", url, error);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function extractRelevantWebsiteLinks(html: string, baseUrl: string): string[] {
+  const base = new URL(baseUrl);
+  const relevant = /servizi|prezzi|pacchetti|matrimoni|wedding|portfolio|about|chi-sono|contatti|listino/i;
+  const links = new Set<string>();
+  const anchorPattern = /<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = anchorPattern.exec(html))) {
+    const href = match[1];
+    const anchorText = htmlToText(match[2]);
+    let candidate: URL;
+    try {
+      candidate = new URL(href, base);
+    } catch {
+      continue;
+    }
+    if (candidate.origin !== base.origin || !/^https?:$/.test(candidate.protocol)) continue;
+    if (!relevant.test(`${candidate.pathname} ${anchorText}`)) continue;
+    candidate.hash = "";
+    candidate.search = "";
+    if (candidate.toString() !== base.toString()) links.add(candidate.toString());
+  }
+  return [...links];
+}
+
+function extractHtmlTitle(html: string): string | null {
+  const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return match ? htmlToText(match[1]).slice(0, 200) : null;
+}
+
+function htmlToText(html: string): string {
+  return html
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<(script|style|noscript)[^>]*>[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 8000);
+}
+
+async function runWebMentionsDeepDive(env: Env, job: DeepDiveJob): Promise<DeepDiveStepResult> {
+  const displayName = job.results.resolve ? asString(job.results.resolve.displayName) : null;
+  if (!displayName) throw new Error("nome concorrente non disponibile per la ricerca web");
+
+  const queries = [
+    `"${displayName}" fotografo recensioni`,
+    `"${displayName}" matrimonio.com OR zankyou`,
+    `"${displayName}" premio OR award fotografo`,
+  ];
+  const prompt = `Cerca sul web queste tre query, una alla volta:\n${queries.map((query) => `- ${query}`).join("\n")}\n\nRispondi SOLO con JSON valido nel formato {"mentions":[{"query":"...","title":"...","snippet":"...","url":"..."}]}. Raccogli al massimo 6 risultati in totale. Usa solo risultati realmente trovati, senza inventare URL o testi.`;
+  const raw = await askClaudeWithWebSearch(env, prompt);
+  const mentions = parseWebMentions(raw);
+  return { ok: true, step: "web-mentions", completedAt: new Date().toISOString(), queries, mentions };
+}
+
+async function askClaudeWithWebSearch(env: Env, prompt: string): Promise<string> {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 1400,
+      messages: [{ role: "user", content: prompt }],
+      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }],
+    }),
+  });
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`Claude web search error: ${response.status} ${raw}`);
+  const data = JSON.parse(raw) as { content?: Array<{ type?: string; text?: string }> };
+  return (data.content ?? [])
+    .filter((block) => block.type === "text")
+    .map((block) => block.text ?? "")
+    .join("\n")
+    .trim();
+}
+
+function parseWebMentions(raw: string): Array<{ query: string; title: string; snippet: string; url: string }> {
+  const json = raw.replace(/^```json\s*|\s*```$/g, "").trim();
+  try {
+    const parsed = JSON.parse(json) as { mentions?: unknown };
+    if (!Array.isArray(parsed.mentions)) return [];
+    return parsed.mentions
+      .filter(isRecord)
+      .map((mention) => ({
+        query: asString(mention.query) ?? "",
+        title: asString(mention.title) ?? "",
+        snippet: asString(mention.snippet) ?? "",
+        url: asString(mention.url) ?? "",
+      }))
+      .filter((mention) => mention.title && mention.url)
+      .slice(0, 6);
+  } catch (error) {
+    console.error("[FASE-2] Risposta web mentions non valida:", raw, error);
+    return [];
+  }
+}
+
 async function runDeepDivePlaceholderStep(step: DeepDiveStep): Promise<DeepDiveStepResult> {
   await new Promise<void>((resolve) => setTimeout(resolve, 1000));
   return { ok: true, step, completedAt: new Date().toISOString() };
@@ -627,7 +780,31 @@ function formatDeepDiveCompletion(job: DeepDiveJob): string {
     }
   }
 
-  lines.push("\nSito, menzioni web e analisi strategica arriveranno nei prossimi step.");
+  const website = job.results.website;
+  if (website && website.skipped !== true) {
+    const pages = Array.isArray(website.pages) ? website.pages.filter(isRecord) : [];
+    lines.push("\nSito");
+    lines.push(`- Pagine lette: ${pages.length}`);
+    for (const page of pages.slice(0, 3)) {
+      const title = asString(page.title) ?? asString(page.url) ?? "pagina senza titolo";
+      lines.push(`- ${title.slice(0, 110)}`);
+    }
+  } else if (website && website.skipped === true) {
+    lines.push("\nSito: nessun URL disponibile, passaggio saltato.");
+  }
+
+  const webMentions = job.results["web-mentions"];
+  if (webMentions) {
+    const mentions = Array.isArray(webMentions.mentions) ? webMentions.mentions.filter(isRecord) : [];
+    lines.push("\nMenzioni web");
+    lines.push(`- Risultati trovati: ${mentions.length}`);
+    for (const mention of mentions.slice(0, 3)) {
+      const title = asString(mention.title);
+      if (title) lines.push(`- ${title.slice(0, 110)}`);
+    }
+  }
+
+  lines.push("\nL'analisi strategica arriverà nell'ultimo step.");
   return lines.join("\n");
 }
 
