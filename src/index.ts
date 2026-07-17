@@ -595,7 +595,15 @@ async function runWebsiteDeepDive(job: DeepDiveJob): Promise<DeepDiveStepResult>
   }
 
   const home = await fetchWebsitePage(websiteUrl);
-  if (!home) throw new Error("sito non raggiungibile o senza contenuto leggibile");
+  if (!home) {
+    return {
+      ok: true,
+      step: "website",
+      completedAt,
+      skipped: true,
+      note: "Il sito ha bloccato o non ha risposto alla lettura automatica.",
+    };
+  }
 
   const links = extractRelevantWebsiteLinks(home.html, home.url);
   const pages: WebsitePage[] = [{ url: home.url, title: extractHtmlTitle(home.html), textContent: htmlToText(home.html) }];
@@ -614,8 +622,9 @@ async function fetchWebsitePage(url: string): Promise<{ url: string; html: strin
   try {
     const response = await fetch(url, {
       headers: {
-        "user-agent": "Mozilla/5.0 (compatible; SaverioResearch/1.0)",
-        accept: "text/html,application/xhtml+xml",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "it-IT,it;q=0.9,en;q=0.8",
       },
       signal: controller.signal,
       redirect: "follow",
@@ -790,7 +799,7 @@ function formatDeepDiveCompletion(job: DeepDiveJob): string {
       lines.push(`- ${title.slice(0, 110)}`);
     }
   } else if (website && website.skipped === true) {
-    lines.push("\nSito: nessun URL disponibile, passaggio saltato.");
+    lines.push(`\nSito: ${asString(website.note) ?? "passaggio saltato."}`);
   }
 
   const webMentions = job.results["web-mentions"];
