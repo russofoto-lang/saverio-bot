@@ -1,0 +1,27 @@
+name = "saverio-bot"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+
+# Il binding KV per la memoria conversazionale.
+# Crea il namespace con:  wrangler kv namespace create SAVERIO_KV
+# poi incolla l'id qui sotto.
+[[kv_namespaces]]
+binding = "SAVERIO_KV"
+id = "d2d8e8b8343e43ad9a87e49c963f52a2"
+
+# I secret NON vanno qui. Li imposti da CLI:
+#   wrangler secret put TELEGRAM_TOKEN
+#   wrangler secret put ANTHROPIC_API_KEY
+#   wrangler secret put WEBHOOK_SECRET   (una stringa a caso che inventi tu)
+[vars]
+TASK_URL = "https://sm-backend-tnq9.onrender.com/task"
+
+# 05:30 UTC = 07:30 italiane in ora legale. In inverno verificare l'orario.
+[triggers]
+crons = ["* * * * *", "25 5 * * *", "30 5 * * *"]
+# Secret da impostare con wrangler secret put:
+#   GOOGLE_SERVICE_ACCOUNT_JSON (JSON completo del service account Firestore)
+#   DIGEST_ENABLED (imposta "false" per il kill switch senza deploy)
+#   GOOGLE_CALENDAR_CLIENT_ID
+#   GOOGLE_CALENDAR_CLIENT_SECRET
+#   GOOGLE_CALENDAR_REFRESH_TOKEN (puoi usare quello approvato per MarianoBot se ha scope calendar)
