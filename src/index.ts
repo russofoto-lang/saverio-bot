@@ -422,14 +422,14 @@ async function runOneDeepDiveStep(env: Env, key: string, job: DeepDiveJob): Prom
 }
 
 async function runDeepDiveStep(env: Env, job: DeepDiveJob, step: DeepDiveStep): Promise<DeepDiveStepResult> {
-  if (step === "resolve") return resolveDeepDiveTarget(job.target);
+  if (step === "resolve") return resolveDeepDiveTarget(env, job.target);
   if (step === "instagram") return runInstagramDeepDive(env, job);
   if (step === "website") return runWebsiteDeepDive(job);
   if (step === "web-mentions") return runWebMentionsDeepDive(env, job);
   return runDeepDivePlaceholderStep(step);
 }
 
-function resolveDeepDiveTarget(target: string): DeepDiveStepResult {
+async function resolveDeepDiveTarget(env: Env, target: string): Promise<DeepDiveStepResult> {
   const cleaned = target.trim();
   const completedAt = new Date().toISOString();
   if (cleaned.startsWith("@")) {
@@ -440,9 +440,35 @@ function resolveDeepDiveTarget(target: string): DeepDiveStepResult {
 
   try {
     const websiteUrl = new URL(cleaned).toString();
-    return { ok: true, step: "resolve", completedAt, websiteUrl, displayName: new URL(websiteUrl).hostname };
+    const fallbackName = new URL(websiteUrl).hostname.replace(/^www\./i, "");
+    const identity = await identifyWebsiteTarget(env, websiteUrl, fallbackName);
+    return {
+      ok: true,
+      step: "resolve",
+      completedAt,
+      websiteUrl,
+      displayName: identity.displayName,
+      ...(identity.igHandle ? { igHandle: identity.igHandle } : {}),
+    };
   } catch {
     throw new Error("per ora usa un @handle Instagram oppure un URL completo");
+  }
+}
+
+async function identifyWebsiteTarget(env: Env, websiteUrl: string, fallbackName: string): Promise<{ displayName: string; igHandle: string | null }> {
+  try {
+    const raw = await askClaudeWithWebSearch(
+      env,
+      `Cerca sul web il brand o fotografo associato a questo sito: ${websiteUrl}. Rispondi SOLO con JSON valido: {"displayName":"nome pubblico esatto","igHandle":"handle Instagram senza @ oppure null"}. Non inventare dati: se un campo non emerge, usa null.`,
+    );
+    const identity = parseJsonRecord(raw);
+    const displayName = asString(identity?.displayName) ?? fallbackName;
+    const rawHandle = asString(identity?.igHandle);
+    const igHandle = rawHandle ? rawHandle.replace(/^@/, "").replace(/[^a-z0-9._]/gi, "") || null : null;
+    return { displayName, igHandle };
+  } catch (error) {
+    console.error("[FASE-2] Risoluzione sito fallita:", error);
+    return { displayName: fallbackName, igHandle: null };
   }
 }
 
@@ -725,11 +751,12 @@ async function askClaudeWithWebSearch(env: Env, prompt: string): Promise<string>
 }
 
 function parseWebMentions(raw: string): Array<{ query: string; title: string; snippet: string; url: string }> {
-  const json = raw.replace(/^```json\s*|\s*```$/g, "").trim();
-  try {
-    const parsed = JSON.parse(json) as { mentions?: unknown };
-    if (!Array.isArray(parsed.mentions)) return [];
-    return parsed.mentions
+  const parsed = parseJsonRecord(raw);
+  if (!parsed || !Array.isArray(parsed.mentions)) {
+    console.error("[FASE-2] Risposta web mentions non valida:", raw);
+    return [];
+  }
+  return parsed.mentions
       .filter(isRecord)
       .map((mention) => ({
         query: asString(mention.query) ?? "",
@@ -739,10 +766,23 @@ function parseWebMentions(raw: string): Array<{ query: string; title: string; sn
       }))
       .filter((mention) => mention.title && mention.url)
       .slice(0, 6);
-  } catch (error) {
-    console.error("[FASE-2] Risposta web mentions non valida:", raw, error);
-    return [];
+}
+
+function parseJsonRecord(raw: string): RawRecord | null {
+  const candidates = [
+    raw.trim(),
+    raw.replace(/^```(?:json)?\s*|\s*```$/g, "").trim(),
+    raw.match(/\{[\s\S]*\}/)?.[0] ?? "",
+  ];
+  for (const candidate of candidates) {
+    try {
+      const parsed: unknown = JSON.parse(candidate);
+      if (isRecord(parsed)) return parsed;
+    } catch {
+      // Prova il prossimo formato: Claude può aggiungere testo o un blocco Markdown.
+    }
   }
+  return null;
 }
 
 async function runDeepDivePlaceholderStep(step: DeepDiveStep): Promise<DeepDiveStepResult> {
