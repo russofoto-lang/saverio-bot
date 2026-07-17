@@ -432,14 +432,20 @@ async function runDeepDiveStep(env: Env, job: DeepDiveJob, step: DeepDiveStep): 
 async function resolveDeepDiveTarget(env: Env, target: string): Promise<DeepDiveStepResult> {
   const cleaned = target.trim();
   const completedAt = new Date().toISOString();
-  if (cleaned.startsWith("@")) {
+  const withoutAt = cleaned.replace(/^@/, "");
+  const looksLikeWebsite = /^https?:\/\//i.test(cleaned)
+    || /^@?www\./i.test(cleaned)
+    || (!cleaned.startsWith("@") && /^[a-z0-9.-]+\.[a-z]{2,}(?:\/.*)?$/i.test(cleaned));
+
+  if (!looksLikeWebsite && cleaned.startsWith("@")) {
     const igHandle = cleaned.slice(1).replace(/[^a-z0-9._]/gi, "");
     if (!igHandle) throw new Error("handle Instagram non valido");
     return { ok: true, step: "resolve", completedAt, igHandle, displayName: igHandle };
   }
 
   try {
-    const websiteUrl = new URL(cleaned).toString();
+    const websiteInput = withoutAt.match(/^https?:\/\//i) ? withoutAt : `https://${withoutAt}`;
+    const websiteUrl = new URL(websiteInput).toString();
     const fallbackName = new URL(websiteUrl).hostname.replace(/^www\./i, "");
     const identity = await identifyWebsiteTarget(env, websiteUrl, fallbackName);
     return {
