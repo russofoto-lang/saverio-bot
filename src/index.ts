@@ -232,10 +232,6 @@ export default {
 async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
     if (event.cron === "* * * * *") {
       await processDuePromemoria(env);
-      return;
-    }
-
-    if (event.cron === "*/2 * * * *") {
       await processNextDeepDiveJob(env);
       return;
     }
