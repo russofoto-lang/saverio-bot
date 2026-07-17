@@ -593,8 +593,42 @@ async function saveDeepDiveJob(env: Env, key: string, job: DeepDiveJob): Promise
 }
 
 function formatDeepDiveCompletion(job: DeepDiveJob): string {
-  const steps = job.steps.map((step) => `✓ ${step}`).join("\n");
-  return `Indagine su «${job.target}» completata.\n\n${steps}\n\nLa coda funziona: ora possiamo sostituire gli step di prova con dati reali.`;
+  const lines = [`Indagine su «${job.target}» completata.`];
+  const instagram = job.results.instagram;
+
+  if (instagram && instagram.skipped === true) {
+    lines.push("\nInstagram: nessun handle disponibile, quindi questo passaggio è stato saltato.");
+  } else if (instagram) {
+    const profile = asRecord(instagram.profile);
+    const metrics = asRecord(instagram.metrics);
+    const followers = asNumber(profile.followers);
+    const postsPerWeek = asNumber(metrics.postsPerWeek);
+    const engagement = asNumber(metrics.averageEngagementRate);
+    const mix = asRecord(metrics.formatMix);
+    const reel = asNumber(mix.reel) ?? 0;
+    const carousel = asNumber(mix.carousel) ?? 0;
+    const photo = asNumber(mix.foto) ?? 0;
+
+    lines.push("\nInstagram");
+    lines.push(`- Post analizzati: ${asNumber(metrics.postsAnalyzed) ?? 0}`);
+    lines.push(`- Follower: ${followers === null ? "dato non disponibile" : followers.toLocaleString("it-IT")}`);
+    lines.push(`- Frequenza: ${postsPerWeek === null ? "dato non disponibile" : `${postsPerWeek} post/settimana`}`);
+    lines.push(`- Engagement medio: ${engagement === null ? "dato non disponibile" : `${engagement}%`}`);
+    lines.push(`- Formati: ${reel}% reel, ${carousel}% caroselli, ${photo}% foto`);
+
+    const samples = Array.isArray(instagram.posts) ? instagram.posts.filter(isRecord).slice(0, 3) : [];
+    if (samples.length) {
+      lines.push("\nUltimi contenuti:");
+      for (const post of samples) {
+        const type = asString(post.type) ?? "contenuto";
+        const caption = (asString(post.caption) ?? "senza caption").slice(0, 110);
+        lines.push(`- ${type}: ${caption}`);
+      }
+    }
+  }
+
+  lines.push("\nSito, menzioni web e analisi strategica arriveranno nei prossimi step.");
+  return lines.join("\n");
 }
 
 async function loadHistory(env: Env, chatId: number): Promise<Turn[]> {
