@@ -18,6 +18,7 @@ interface Env {
   WEBHOOK_SECRET: string;
   TASK_URL: string;
   AGENT_KEY: string;
+  APIFY_TOKEN?: string;
   DIGEST_ENABLED?: string;
   GOOGLE_SERVICE_ACCOUNT_JSON?: string;
   GOOGLE_CALENDAR_CLIENT_ID?: string;
@@ -43,6 +44,8 @@ const GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar";
 const GOOGLE_CALENDAR_ID = "primary";
 const DEEP_DIVE_JOB_TTL = 60 * 60 * 24;
 const DEEP_DIVE_STEPS = ["resolve", "instagram", "website", "web-mentions", "synthesize"] as const;
+const APIFY_INSTAGRAM_POST_ACTOR = "apify~instagram-post-scraper";
+const DEEP_DIVE_POST_LIMIT = 30;
 
 let firestoreAccessToken: { token: string; expiresAt: number } | null = null;
 let googleCalendarAccessToken: { token: string; expiresAt: number } | null = null;
@@ -258,6 +261,12 @@ async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
 
 type Turn = { role: "user" | "assistant"; content: string };
 type DeepDiveStep = typeof DEEP_DIVE_STEPS[number];
+type DeepDiveStepResult = {
+  ok: boolean;
+  step: DeepDiveStep;
+  completedAt: string;
+  [key: string]: unknown;
+};
 type DeepDiveJob = {
   type: "deep-dive";
   target: string;
@@ -265,7 +274,7 @@ type DeepDiveJob = {
   status: "pending" | "running" | "done" | "failed";
   currentStep: number;
   steps: DeepDiveStep[];
-  results: Partial<Record<DeepDiveStep, { ok: boolean; step: DeepDiveStep; completedAt: string }>>;
+  results: Partial<Record<DeepDiveStep, DeepDiveStepResult>>;
   createdAt: string;
   completedAt?: string;
   error: string | null;
@@ -337,7 +346,7 @@ async function runOneDeepDiveStep(env: Env, key: string, job: DeepDiveJob): Prom
 
   try {
     job.status = "running";
-    job.results[step] = await runDeepDivePlaceholderStep(step);
+    job.results[step] = await runDeepDiveStep(env, job, step);
     job.currentStep += 1;
 
     if (job.currentStep === job.steps.length) {
@@ -360,7 +369,169 @@ async function runOneDeepDiveStep(env: Env, key: string, job: DeepDiveJob): Prom
   }
 }
 
-async function runDeepDivePlaceholderStep(step: DeepDiveStep): Promise<{ ok: boolean; step: DeepDiveStep; completedAt: string }> {
+async function runDeepDiveStep(env: Env, job: DeepDiveJob, step: DeepDiveStep): Promise<DeepDiveStepResult> {
+  if (step === "resolve") return resolveDeepDiveTarget(job.target);
+  if (step === "instagram") return runInstagramDeepDive(env, job);
+  return runDeepDivePlaceholderStep(step);
+}
+
+function resolveDeepDiveTarget(target: string): DeepDiveStepResult {
+  const cleaned = target.trim();
+  const completedAt = new Date().toISOString();
+  if (cleaned.startsWith("@")) {
+    const igHandle = cleaned.slice(1).replace(/[^a-z0-9._]/gi, "");
+    if (!igHandle) throw new Error("handle Instagram non valido");
+    return { ok: true, step: "resolve", completedAt, igHandle, displayName: igHandle };
+  }
+
+  try {
+    const websiteUrl = new URL(cleaned).toString();
+    return { ok: true, step: "resolve", completedAt, websiteUrl, displayName: new URL(websiteUrl).hostname };
+  } catch {
+    throw new Error("per ora usa un @handle Instagram oppure un URL completo");
+  }
+}
+
+async function runInstagramDeepDive(env: Env, job: DeepDiveJob): Promise<DeepDiveStepResult> {
+  const igHandle = job.results.resolve ? asString(job.results.resolve.igHandle) : null;
+  const completedAt = new Date().toISOString();
+
+  if (!igHandle) {
+    return { ok: true, step: "instagram", completedAt, skipped: true, note: "Nessun handle Instagram disponibile." };
+  }
+  if (!env.APIFY_TOKEN) throw new Error("secret APIFY_TOKEN mancante su saverio-bot");
+
+  const rawPosts = await fetchInstagramPostsForDeepDive(env, igHandle);
+  const posts = rawPosts.slice(0, DEEP_DIVE_POST_LIMIT).map(toDeepDiveInstagramPost);
+  const profile = extractInstagramProfile(rawPosts[0]);
+  const metrics = calculateInstagramMetrics(posts, profile.followers);
+
+  return {
+    ok: true,
+    step: "instagram",
+    completedAt,
+    igHandle,
+    profile,
+    metrics,
+    posts,
+  };
+}
+
+async function fetchInstagramPostsForDeepDive(env: Env, username: string): Promise<RawRecord[]> {
+  const runRes = await fetch(
+    `https://api.apify.com/v2/acts/${APIFY_INSTAGRAM_POST_ACTOR}/runs?token=${env.APIFY_TOKEN}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: [username], resultsLimit: DEEP_DIVE_POST_LIMIT }),
+    },
+  );
+  if (!runRes.ok) throw new Error(`Apify run error: ${runRes.status}`);
+
+  const runId = asString(asRecord(asRecord(await runRes.json()).data).id);
+  if (!runId) throw new Error("Apify run senza id");
+
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 5000));
+    const statusRes = await fetch(`https://api.apify.com/v2/actor-runs/${runId}?token=${env.APIFY_TOKEN}`);
+    if (!statusRes.ok) throw new Error(`Apify status error: ${statusRes.status}`);
+    const status = asString(asRecord(asRecord(await statusRes.json()).data).status);
+    if (status === "SUCCEEDED") break;
+    if (status && ["FAILED", "ABORTED", "TIMED-OUT"].includes(status)) throw new Error(`Apify run ${status}`);
+    if (attempt === 11) throw new Error("Apify run timeout");
+  }
+
+  const dataRes = await fetch(`https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${env.APIFY_TOKEN}`);
+  if (!dataRes.ok) throw new Error(`Apify dataset error: ${dataRes.status}`);
+  const data: unknown = await dataRes.json();
+  if (!Array.isArray(data)) throw new Error("Apify dataset non valido");
+  return data.filter(isRecord);
+}
+
+type DeepDiveInstagramPost = {
+  type: "reel" | "carousel" | "foto" | "altro";
+  caption: string;
+  likes: number | null;
+  comments: number | null;
+  date: string | null;
+  url: string | null;
+};
+
+function toDeepDiveInstagramPost(post: RawRecord): DeepDiveInstagramPost {
+  const rawType = asString(post.type)?.toLowerCase() ?? "";
+  const type = rawType.includes("video") || rawType.includes("reel")
+    ? "reel"
+    : rawType.includes("sidecar") || rawType.includes("carousel")
+      ? "carousel"
+      : rawType.includes("image") || rawType.includes("photo") ? "foto" : "altro";
+  const timestamp = firstString(post, ["timestamp", "takenAt", "date"]);
+  const parsedDate = timestamp && !Number.isNaN(Date.parse(timestamp)) ? new Date(timestamp).toISOString() : null;
+  return {
+    type,
+    caption: (asString(post.caption) ?? "").replace(/\s+/g, " ").slice(0, 200),
+    likes: firstNumber(post, ["likesCount", "likes"]),
+    comments: firstNumber(post, ["commentsCount", "comments"]),
+    date: parsedDate,
+    url: firstString(post, ["url", "postUrl"]),
+  };
+}
+
+function extractInstagramProfile(post: RawRecord | undefined): { bio: string | null; followers: number | null; postCount: number | null } {
+  if (!post) return { bio: null, followers: null, postCount: null };
+  const owner = asRecord(post.owner);
+  return {
+    bio: firstString(post, ["ownerBio", "biography", "bio"]) ?? firstString(owner, ["biography", "bio"]),
+    followers: firstNumber(post, ["ownerFollowersCount", "followersCount", "followers"]) ?? firstNumber(owner, ["followersCount", "followers"]),
+    postCount: firstNumber(post, ["ownerPostsCount", "postsCount"]) ?? firstNumber(owner, ["postsCount"]),
+  };
+}
+
+function calculateInstagramMetrics(posts: DeepDiveInstagramPost[], followers: number | null): {
+  postsAnalyzed: number;
+  postsPerWeek: number | null;
+  averageEngagementRate: number | null;
+  formatMix: Record<DeepDiveInstagramPost["type"], number>;
+} {
+  const datedPosts = posts.filter((post) => post.date).map((post) => Date.parse(post.date!));
+  const oldest = datedPosts.length ? Math.min(...datedPosts) : null;
+  const newest = datedPosts.length ? Math.max(...datedPosts) : null;
+  const weeks = oldest && newest ? Math.max(1, (newest - oldest) / (7 * 24 * 60 * 60 * 1000)) : null;
+  const interactions = posts
+    .filter((post) => post.likes !== null || post.comments !== null)
+    .map((post) => (post.likes ?? 0) + (post.comments ?? 0));
+  const averageEngagementRate = followers && interactions.length
+    ? Math.round((interactions.reduce((sum, value) => sum + value, 0) / interactions.length / followers) * 10_000) / 100
+    : null;
+  const count = (type: DeepDiveInstagramPost["type"]) => posts.filter((post) => post.type === type).length;
+  const toPercent = (type: DeepDiveInstagramPost["type"]) => posts.length ? Math.round((count(type) / posts.length) * 100) : 0;
+
+  return {
+    postsAnalyzed: posts.length,
+    postsPerWeek: weeks ? Math.round((posts.length / weeks) * 10) / 10 : null,
+    averageEngagementRate,
+    formatMix: { reel: toPercent("reel"), carousel: toPercent("carousel"), foto: toPercent("foto"), altro: toPercent("altro") },
+  };
+}
+
+function firstString(record: RawRecord, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = asString(record[key]);
+    if (value) return value;
+  }
+  return null;
+}
+
+function firstNumber(record: RawRecord, keys: string[]): number | null {
+  for (const key of keys) {
+    const direct = asNumber(record[key]);
+    if (direct !== null) return direct;
+    const stringValue = asString(record[key]);
+    if (stringValue && Number.isFinite(Number(stringValue))) return Number(stringValue);
+  }
+  return null;
+}
+
+async function runDeepDivePlaceholderStep(step: DeepDiveStep): Promise<DeepDiveStepResult> {
   await new Promise<void>((resolve) => setTimeout(resolve, 1000));
   return { ok: true, step, completedAt: new Date().toISOString() };
 }
