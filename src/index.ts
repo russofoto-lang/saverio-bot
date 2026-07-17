@@ -1436,6 +1436,11 @@ function getCalendarReadRange(text: string, timezone: string): { start: string; 
   let start = new Date(Date.UTC(today.year, today.month - 1, today.day));
   let days = 1;
   let label = "oggi";
+  const months: Record<string, number> = {
+    gennaio: 0, febbraio: 1, marzo: 2, aprile: 3, maggio: 4, giugno: 5,
+    luglio: 6, agosto: 7, settembre: 8, ottobre: 9, novembre: 10, dicembre: 11,
+  };
+  const explicitDate = value.match(/\b([1-9]|[12]\d|3[01])\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)(?:\s+(\d{4}))?\b/);
   const weekdays: Record<string, { day: number; label: string }> = {
     lunedi: { day: 1, label: "lunedi prossimo" },
     martedi: { day: 2, label: "martedi prossimo" },
@@ -1447,7 +1452,22 @@ function getCalendarReadRange(text: string, timezone: string): { start: string; 
   };
   const weekdayMatch = value.match(/\b(lunedi|martedi|mercoledi|giovedi|venerdi|sabato|domenica)\s+prossim[oa]\b/);
 
-  if (value.includes("dopodomani")) {
+  if (explicitDate) {
+    const day = Number(explicitDate[1]);
+    const month = months[explicitDate[2]];
+    let year = explicitDate[3] ? Number(explicitDate[3]) : today.year;
+    const candidate = new Date(Date.UTC(year, month, day));
+    if (candidate.getUTCMonth() !== month || candidate.getUTCDate() !== day) {
+      return { start: toRomeBoundaryIso(start, timezone), end: toRomeBoundaryIso(new Date(start.getTime() + 86_400_000), timezone), label: "oggi" };
+    }
+    if (!explicitDate[3] && candidate.getTime() < start.getTime()) {
+      year += 1;
+      start = new Date(Date.UTC(year, month, day));
+    } else {
+      start = candidate;
+    }
+    label = `il ${day} ${explicitDate[2]} ${year}`;
+  } else if (value.includes("dopodomani")) {
     start.setUTCDate(start.getUTCDate() + 2);
     label = "dopodomani";
   } else if (value.includes("domani")) {
