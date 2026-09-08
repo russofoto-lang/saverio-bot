@@ -22,6 +22,4 @@ crons = ["30 5 * * *", "*/2 * * * *"]
 # Secret da impostare con wrangler secret put:
 #   GOOGLE_SERVICE_ACCOUNT_JSON (JSON completo del service account Firestore)
 #   DIGEST_ENABLED (imposta "false" per il kill switch senza deploy)
-#   GOOGLE_CALENDAR_CLIENT_ID
-#   GOOGLE_CALENDAR_CLIENT_SECRET
-#   GOOGLE_CALENDAR_REFRESH_TOKEN (puoi usare quello approvato per MarianoBot se ha scope calendar)
+#   GEMINI_API_KEY (Gemini embedding e trascrizione dei vocali Telegram)

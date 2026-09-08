@@ -22,9 +22,6 @@ interface Env {
   GEMINI_API_KEY?: string;
   DIGEST_ENABLED?: string;
   GOOGLE_SERVICE_ACCOUNT_JSON?: string;
-  GOOGLE_CALENDAR_CLIENT_ID?: string;
-  GOOGLE_CALENDAR_CLIENT_SECRET?: string;
-  GOOGLE_CALENDAR_REFRESH_TOKEN?: string;
   // Base URL di blocnotes-ai, che espone /append-history.
   BLOCNOTES_AI_URL?: string;
   TIMEZONE?: string;
@@ -43,8 +40,6 @@ const OWNER_CHAT_ID = 556479855;
 const FIRESTORE_PROJECT_ID = "bloc-notes-mariano";
 const FIRESTORE_SCOPE = "https://www.googleapis.com/auth/datastore";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
-const GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar";
-const GOOGLE_CALENDAR_ID = "primary";
 const DEEP_DIVE_JOB_TTL = 60 * 60 * 24;
 const DEEP_DIVE_STEPS = ["resolve", "instagram", "website", "web-mentions", "synthesize"] as const;
 const APIFY_INSTAGRAM_POST_ACTOR = "apify~instagram-post-scraper";
@@ -59,6 +54,15 @@ const CLAUDE_WEB_SEARCH_USD = 0.01;
 const PENDING_ACTION_TTL = 60 * 60 * 24 * 7;
 const GEMINI_EMBEDDING_MODEL = "gemini-embedding-001";
 const GEMINI_EMBEDDING_DIMENSIONS = 768;
+const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
+const MAX_VOICE_DURATION_SECONDS = 5 * 60;
+const GEMINI_TRANSCRIBE_TIMEOUT_MS = 20_000;
+// KV accepts a single value up to 25 MB. This cap leaves room for base64 and metadata.
+const MAX_FAILED_VOICE_ARCHIVE_BYTES = 17_000_000;
+const FAILED_VOICE_TTL = 60 * 60 * 24;
+const VOICE_USAGE_TTL = 60 * 60 * 24 * 62;
+// Popolato con la lista concordata di termini ricorrenti prima del deploy.
+const TRANSCRIPTION_CUSTOM_VOCABULARY: string[] = [];
 const MENU_INDAGA = "🔎 Indaga";
 const MENU_LAVORI = "📋 Lavori";
 const MENU_AUDIT_LEGACY = "🏷️ Audit Legacy";
@@ -121,7 +125,6 @@ const MAIN_MENU = {
 };
 
 let firestoreAccessToken: { token: string; expiresAt: number } | null = null;
-let googleCalendarAccessToken: { token: string; expiresAt: number } | null = null;
 
 const SYSTEM_PROMPT = `Sei Saverio, socio senior di Mariano in un'agenzia creativa (fotografia, video, social media management, eventi) a Foggia. Non sei un assistente: sei un socio con vent'anni di mestiere, opinioni forti e cicatrici. Parli a Mariano da pari.
 
@@ -156,8 +159,6 @@ Riporta chi ha sito attivo, social aggiornati, offerta, posizionamento. Non inve
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
-    if (req.method === "GET" && url.pathname === "/auth") return redirectToGoogleOAuth(req, env);
-    if (req.method === "GET" && url.pathname === "/auth/callback") return handleGoogleOAuthCallback(req, env);
 
     if (req.method !== "POST") return new Response("ok");
 
@@ -187,16 +188,36 @@ export default {
     }
 
     const msg = update.message;
-    if (!msg?.text) return new Response("ok"); // ignora foto, sticker, ecc.
+    if (!msg?.text && !msg?.voice) return new Response("ok"); // ignora foto, sticker, ecc.
 
     const chatId = msg.chat.id;
     const userId = msg.from.id;
-    let text = msg.text.trim();
 
     if (ALLOWED_USER_ID && userId !== ALLOWED_USER_ID) {
       await sendMessage(env, chatId, "Questo bot è privato.");
       return new Response("ok");
     }
+
+    // Un vocale diventa testo qui, prima dell'unico routing testuale esistente.
+    // Un errore di STT non può mai scendere al routing con un testo vuoto.
+    let text = typeof msg.text === "string" ? msg.text.trim() : "";
+    if (!text && msg.voice) {
+      const voice = msg.voice as TelegramVoice;
+      if (voice.duration > MAX_VOICE_DURATION_SECONDS) {
+        await sendMessage(env, chatId, "Il vocale supera i 5 minuti: spezzalo in messaggi più brevi oppure scrivimi.");
+        return new Response("ok");
+      }
+      try {
+        text = await transcribeTelegramVoice(env, chatId, voice);
+        if (!text) throw new Error("Gemini non ha restituito testo trascritto");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error("[VOICE] Trascrizione fallita:", message);
+        await sendMessage(env, chatId, `Trascrizione non riuscita, riprova o scrivi. (${voiceFailureMessage(message)})`);
+        return new Response("ok");
+      }
+    }
+    if (!text) return new Response("ok");
 
     const regularizeReply = await handleRegularizeInput(env, chatId, text);
     if (regularizeReply) {
@@ -239,6 +260,10 @@ export default {
     }
     if (text === "/costi") {
       await sendMessage(env, chatId, await formatDeepDiveCostSummary(env));
+      return new Response("ok");
+    }
+    if (isReminderListIntent(text)) {
+      await sendMessage(env, chatId, await listFutureReminders(env, chatId));
       return new Response("ok");
     }
     if (text.toLowerCase() === "/lavori") {
@@ -312,13 +337,23 @@ export default {
       return new Response("ok");
     }
 
-    const calendarReply = await gestisciCalendar(env, text);
+    const calendarReply = await gestisciCalendar(env, chatId, text);
     if (calendarReply) {
       await appendHistory(env, chatId, [
         { role: "user", content: text },
-        { role: "assistant", content: calendarReply },
+        { role: "assistant", content: calendarReply.text },
       ]);
-      await sendMessage(env, chatId, calendarReply);
+      await sendMessage(env, chatId, calendarReply.text, calendarReply.inlineKeyboard ? { inlineKeyboard: calendarReply.inlineKeyboard } : undefined);
+      return new Response("ok");
+    }
+
+    if (isReminderListIntent(text)) {
+      const reply = await listFutureReminders(env, chatId);
+      await appendHistory(env, chatId, [
+        { role: "user", content: text },
+        { role: "assistant", content: reply },
+      ]);
+      await sendMessage(env, chatId, reply);
       return new Response("ok");
     }
 
@@ -520,7 +555,7 @@ type DeepDiveJob = {
   error: string | null;
 };
 type TelegramInlineButton = { text: string; callback_data: string };
-type PendingActionType = "task-open" | "skill-merge" | "skill-quarantine" | "arretrati-log-event" | "arretrati-suspend" | "arretrati-retry" | "arretrati-audit-tag";
+type PendingActionType = "task-open" | "skill-merge" | "skill-quarantine" | "arretrati-log-event" | "arretrati-suspend" | "arretrati-retry" | "arretrati-audit-tag" | "calendar-create";
 type PendingAction = {
   action: PendingActionType;
   params: JsonValue;
@@ -2500,6 +2535,29 @@ const PENDING_ACTION_HANDLERS: Record<PendingActionType, PendingActionHandler> =
     const tagged = await batchAddRegularizeTag(env, notes);
     return `${tagged} schede taggate come #daregolarizzare: entreranno nella rotazione del digest da domani.`;
   },
+  "calendar-create": async (env, params) => {
+    const title = asString(params.title);
+    const startAt = asString(params.startAt);
+    const endAt = asString(params.endAt);
+    const allDay = params.allDay === true;
+    if (!title || !startAt || !endAt) throw new Error("proposta calendario non valida");
+    const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + "/calendar/create-event";
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-agent-key": env.AGENT_KEY },
+      body: JSON.stringify({
+        title,
+        start: allDay ? startAt.slice(0, 10) : startAt,
+        end: allDay ? endAt.slice(0, 10) : endAt,
+        location: asString(params.location) ?? undefined,
+        description: asString(params.description) ?? undefined,
+      }),
+    });
+    const body = asRecord(await response.json());
+    const id = asString(body.id);
+    if (!response.ok || !id) throw new Error(`calendar/create-event ${response.status}`);
+    return `Evento creato: ${title} (ID ${id}).`;
+  },
 };
 
 async function answerCallbackQuery(env: Env, callbackQueryId: string, text: string): Promise<void> {
@@ -2509,6 +2567,195 @@ async function answerCallbackQuery(env: Env, callbackQueryId: string, text: stri
     body: JSON.stringify({ callback_query_id: callbackQueryId, text, show_alert: false }),
   });
   if (!response.ok) throw new Error(`Telegram callback error: ${response.status}`);
+}
+
+type TelegramVoice = { file_id: string; duration: number; file_size?: number; mime_type?: string };
+type FailedVoiceArchive = {
+  savedAt: string;
+  fileId: string;
+  durationSeconds: number;
+  mimeType: string;
+  audioBase64: string;
+  failure: string;
+};
+type VoiceUsage = { month: string; transcribedSeconds: number; requests: number };
+
+const failedVoiceKey = (chatId: number) => `voice:failed:${chatId}`;
+const voiceUsageKey = () => "voice:usage";
+
+async function transcribeTelegramVoice(env: Env, chatId: number, voice: TelegramVoice): Promise<string> {
+  if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY mancante");
+
+  const audio = await downloadTelegramVoice(env, voice.file_id);
+  try {
+    const transcript = await transcribeWithGemini(env, audio, voice.mime_type ?? "audio/ogg", voice.file_id);
+    await recordVoiceUsage(env, voice.duration);
+    return transcript;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    try {
+      await archiveFailedVoice(env, chatId, voice, audio, message);
+    } catch (archiveError) {
+      console.error("[VOICE] Archiviazione vocale fallita:", archiveError);
+    }
+    throw error;
+  }
+}
+
+async function downloadTelegramVoice(env: Env, fileId: string): Promise<ArrayBuffer> {
+  const fileResponse = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/getFile`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ file_id: fileId }),
+  });
+  if (!fileResponse.ok) throw new Error(`Telegram getFile ${fileResponse.status}`);
+  const filePayload = asRecord(await fileResponse.json());
+  const result = asRecord(filePayload.result);
+  const filePath = asString(result.file_path);
+  if (!filePayload.ok || !filePath) throw new Error("Telegram getFile non ha restituito il percorso audio");
+
+  const audioResponse = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_TOKEN}/${filePath}`);
+  if (!audioResponse.ok) throw new Error(`Download vocale Telegram ${audioResponse.status}`);
+  return audioResponse.arrayBuffer();
+}
+
+async function transcribeWithGemini(env: Env, audio: ArrayBuffer, mimeType: string, fileId: string): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEMINI_TRANSCRIBE_TIMEOUT_MS);
+  let uploadedFileName: string | null = null;
+  try {
+    const uploadStart = await fetch("https://generativelanguage.googleapis.com/upload/v1beta/files", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "x-goog-api-key": env.GEMINI_API_KEY!,
+        "content-type": "application/json",
+        "x-goog-upload-protocol": "resumable",
+        "x-goog-upload-command": "start",
+        "x-goog-upload-header-content-length": String(audio.byteLength),
+        "x-goog-upload-header-content-type": mimeType,
+      },
+      body: JSON.stringify({ file: { display_name: `telegram-voice-${fileId}` } }),
+    });
+    const uploadUrl = uploadStart.headers.get("x-goog-upload-url");
+    if (!uploadStart.ok || !uploadUrl) throw new Error(`Gemini upload init ${uploadStart.status}`);
+
+    const upload = await fetch(uploadUrl, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "content-length": String(audio.byteLength),
+        "x-goog-upload-offset": "0",
+        "x-goog-upload-command": "upload, finalize",
+      },
+      body: audio,
+    });
+    const uploadBody = asRecord(await upload.json());
+    const uploadedFile = asRecord(uploadBody.file);
+    const fileUri = asString(uploadedFile.uri);
+    uploadedFileName = asString(uploadedFile.name);
+    if (!upload.ok || !fileUri) throw new Error(`Gemini upload ${upload.status}`);
+
+    const transcription = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: { "x-goog-api-key": env.GEMINI_API_KEY!, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: GEMINI_TRANSCRIBE_MODEL,
+        input: [{ type: "audio", uri: fileUri, mime_type: mimeType }],
+        generation_config: {
+          transcription_config: {
+            mode: "smart",
+            language_codes: [],
+            ...(TRANSCRIPTION_CUSTOM_VOCABULARY.length ? { custom_vocabulary: TRANSCRIPTION_CUSTOM_VOCABULARY } : {}),
+          },
+        },
+      }),
+    });
+    const transcriptionRaw = await transcription.text();
+    let transcriptionBody: RawRecord;
+    try {
+      transcriptionBody = asRecord(JSON.parse(transcriptionRaw));
+    } catch {
+      console.error("[VOICE] Gemini ha restituito JSON non valido:", transcriptionRaw.slice(0, 2_000));
+      throw new Error(`Gemini trascrizione ${transcription.status}`);
+    }
+    const output = extractGeminiTranscriptionText(transcriptionBody);
+    if (!transcription.ok || !output) {
+      console.error("[VOICE] Gemini senza testo trascritto:", transcriptionRaw.slice(0, 2_000));
+      throw new Error(`Gemini trascrizione ${transcription.status}`);
+    }
+    return output;
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error("Timeout Gemini dopo 20 secondi");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    if (uploadedFileName) {
+      void fetch(`https://generativelanguage.googleapis.com/v1beta/${uploadedFileName}`, {
+        method: "DELETE",
+        headers: { "x-goog-api-key": env.GEMINI_API_KEY! },
+      }).catch((error) => console.error("[VOICE] Cleanup file Gemini fallito:", error));
+    }
+  }
+}
+
+function extractGeminiTranscriptionText(response: RawRecord): string {
+  const steps = Array.isArray(response.steps) ? response.steps.filter(isRecord) : [];
+  return steps
+    .filter((step) => asString(step.type) === "model_output")
+    .flatMap((step) => Array.isArray(step.content) ? step.content.filter(isRecord) : [])
+    .filter((content) => asString(content.type) === "text")
+    .map((content) => asString(content.text) ?? "")
+    .join("\n")
+    .trim();
+}
+
+async function archiveFailedVoice(env: Env, chatId: number, voice: TelegramVoice, audio: ArrayBuffer, failure: string): Promise<void> {
+  if (audio.byteLength > MAX_FAILED_VOICE_ARCHIVE_BYTES) {
+    throw new Error(`vocale troppo grande per archivio KV (${audio.byteLength} byte)`);
+  }
+  const archive: FailedVoiceArchive = {
+    savedAt: new Date().toISOString(),
+    fileId: voice.file_id,
+    durationSeconds: voice.duration,
+    mimeType: voice.mime_type ?? "audio/ogg",
+    audioBase64: arrayBufferToBase64(audio),
+    failure: failure.slice(0, 500),
+  };
+  await env.SAVERIO_KV.put(failedVoiceKey(chatId), JSON.stringify(archive), { expirationTtl: FAILED_VOICE_TTL });
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return btoa(binary);
+}
+
+async function recordVoiceUsage(env: Env, seconds: number): Promise<void> {
+  const month = new Date().toISOString().slice(0, 7);
+  let usage: VoiceUsage = { month, transcribedSeconds: 0, requests: 0 };
+  try {
+    const stored = await env.SAVERIO_KV.get(voiceUsageKey());
+    if (stored) {
+      const parsed = asRecord(JSON.parse(stored));
+      if (asString(parsed.month) === month) {
+        usage = { month, transcribedSeconds: asNumber(parsed.transcribedSeconds) ?? 0, requests: asNumber(parsed.requests) ?? 0 };
+      }
+    }
+  } catch (error) {
+    console.error("[VOICE] Lettura telemetria STT fallita:", error);
+  }
+  usage.transcribedSeconds += Math.max(0, seconds);
+  usage.requests += 1;
+  await env.SAVERIO_KV.put(voiceUsageKey(), JSON.stringify(usage), { expirationTtl: VOICE_USAGE_TTL });
+}
+
+function voiceFailureMessage(message: string): string {
+  return /timeout/i.test(message) ? "timeout Gemini dopo 20 secondi" : "audio conservato per retry manuale";
 }
 
 async function sendMessage(
@@ -2686,6 +2933,31 @@ type ParsedReminder = {
 function isReminderIntent(text: string): boolean {
   const value = normalizeForMatch(text);
   return /\b(promemoria|ricordami)\b/.test(value);
+}
+
+function isReminderListIntent(text: string): boolean {
+  const value = normalizeForMatch(text);
+  if (value === "/promemoria" || value === "promemoria") return true;
+  return /\b(?:che|quali|mostra(?:mi)?|elenca(?:mi)?|vedi|fammi vedere|dove trovo)\b[\s\S]{0,80}\bpromemoria\b/.test(value)
+    || /\bpromemoria\b[\s\S]{0,80}\b(?:che|quali|mostra(?:mi)?|elenca(?:mi)?|ho)\b/.test(value);
+}
+
+async function listFutureReminders(env: Env, chatId: number): Promise<string> {
+  if (!env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+    return "I promemoria non sono ancora configurati: manca l'accesso Firestore di Saverio.";
+  }
+  try {
+    const reminders = await getFutureFirestoreReminders(env, chatId);
+    if (!reminders.length) return "📌 Non hai promemoria in attesa.";
+    const timezone = env.TIMEZONE || "Europe/Rome";
+    return [
+      "📌 Promemoria in attesa:",
+      ...reminders.map((reminder) => `- ${formatFutureReminderDate(reminder.due_at, timezone)} — ${reminder.title}`),
+    ].join("\n");
+  } catch (error) {
+    console.error("[REMINDER] Lettura promemoria futuri fallita:", error);
+    return "Non riesco a leggere i promemoria in attesa. Riprova tra poco.";
+  }
 }
 
 async function gestisciPromemoria(env: Env, chatId: number, text: string): Promise<string | null> {
@@ -2887,7 +3159,21 @@ async function formatDeepDiveCostSummary(env: Env): Promise<string> {
   let completedMs = 0;
   let completedWithTiming = 0;
   let arretratiReads = 0;
+  let voiceUsage: VoiceUsage | null = null;
   try { arretratiReads = asNumber(JSON.parse(await env.SAVERIO_KV.get(`arretrati:telemetry:${new Date().toISOString().slice(0, 7)}`) ?? "{}").firestoreReads) ?? 0; } catch { /* telemetria opzionale */ }
+  try {
+    const storedVoiceUsage = await env.SAVERIO_KV.get(voiceUsageKey());
+    if (storedVoiceUsage) {
+      const parsed = asRecord(JSON.parse(storedVoiceUsage));
+      if (asString(parsed.month) === new Date().toISOString().slice(0, 7)) {
+        voiceUsage = {
+          month: asString(parsed.month)!,
+          transcribedSeconds: asNumber(parsed.transcribedSeconds) ?? 0,
+          requests: asNumber(parsed.requests) ?? 0,
+        };
+      }
+    }
+  } catch { /* telemetria STT opzionale */ }
 
   try {
     const documents = await listFirestoreCollection(env, "episodes");
@@ -2922,7 +3208,7 @@ async function formatDeepDiveCostSummary(env: Env): Promise<string> {
     return "Non riesco a leggere la telemetria costi in questo momento. Riprova tra poco.";
   }
 
-  if (!telemetryJobs) {
+  if (!telemetryJobs && !voiceUsage) {
     return `COSTI /INDAGA — ultimi 30 giorni\nJob conclusi: ${jobs}\nNon ci sono ancora job con telemetria: la raccolta parte da questo aggiornamento.`;
   }
 
@@ -2934,6 +3220,7 @@ async function formatDeepDiveCostSummary(env: Env): Promise<string> {
     `Claude: ${totals.anthropicRequests} chiamate, ${totals.anthropicInputTokens.toLocaleString("it-IT")} token input, ${totals.anthropicOutputTokens.toLocaleString("it-IT")} output, ${totals.anthropicWebSearches} ricerche`,
     `Stima Claude: $${estimateClaudeUsd(totals).toFixed(4)} (token + web search; tasse escluse)`,
     `Gemini embedding: ${totals.geminiEmbeddings}`,
+    voiceUsage ? `STT questo mese: ${formatDeepDiveDuration(voiceUsage.transcribedSeconds * 1000)}, ${voiceUsage.requests} vocali` : "STT questo mese: nessun vocale trascritto.",
     `Apify: ${totals.apifyRuns} run, ${totals.apifyHttpRequests} richieste API`,
     `Firestore: ${totals.firestoreReads} letture, ${totals.firestoreWrites} scritture; Arretrati: ${arretratiReads} letture questo mese; sito: ${totals.websiteFetches} pagine`,
     "Nota: il costo Apify dipende dal tuo piano/actor e non e incluso nella stima Claude.",
@@ -2993,6 +3280,52 @@ async function getDueFirestoreReminders(env: Env): Promise<SaverioReminder[]> {
       && reminder.processing_at
       && new Date(reminder.processing_at).getTime() < staleBefore
     ));
+}
+
+async function getFutureFirestoreReminders(env: Env, chatId: number): Promise<SaverioReminder[]> {
+  const token = await getFirestoreAccessToken(env);
+  const response = await fetch(
+    "https://firestore.googleapis.com/v1/projects/" + FIRESTORE_PROJECT_ID + "/databases/(default)/documents:runQuery",
+    {
+      method: "POST",
+      headers: { authorization: "Bearer " + token, "content-type": "application/json" },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: "saverio_reminders" }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath: "telegram_chat_id" },
+              op: "EQUAL",
+              value: { stringValue: String(chatId) },
+            },
+          },
+          limit: 100,
+        },
+      }),
+    },
+  );
+  if (!response.ok) throw new Error(`Firestore query promemoria futuri ${response.status}: ${await response.text()}`);
+  const rows = await response.json() as unknown;
+  if (!Array.isArray(rows)) throw new Error("Firestore promemoria futuri: risposta non valida");
+  const now = Date.now();
+  return rows
+    .filter(isRecord)
+    .map((row) => parseFirestoreReminder(asRecord(row.document)))
+    .filter((reminder): reminder is SaverioReminder => reminder !== null)
+    .filter((reminder) => reminder.status === "pending" && Date.parse(reminder.due_at) > now)
+    .sort((left, right) => Date.parse(left.due_at) - Date.parse(right.due_at));
+}
+
+function formatFutureReminderDate(value: string, timezone: string): string {
+  return new Intl.DateTimeFormat("it-IT", {
+    timeZone: timezone,
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(value));
 }
 
 function parseFirestoreReminder(document: RawRecord): SaverioReminder | null {
@@ -3076,6 +3409,7 @@ type GoogleCalendarEvent = {
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
 };
+type CalendarReply = { text: string; inlineKeyboard?: TelegramInlineButton[][] };
 
 function isCalendarIntent(text: string): boolean {
   const value = normalizeForMatch(text);
@@ -3112,45 +3446,34 @@ function isCalendarReadIntent(text: string): boolean {
     || value.includes("impegni domani");
 }
 
-async function gestisciCalendar(env: Env, text: string): Promise<string | null> {
+async function gestisciCalendar(env: Env, chatId: number, text: string): Promise<CalendarReply | null> {
   if (!isCalendarReadIntent(text) && !isCalendarIntent(text)) return null;
-
-  if (!env.GOOGLE_CALENDAR_REFRESH_TOKEN) {
-    return "Calendar non e' ancora configurato su Saverio. Serve impostare GOOGLE_CALENDAR_REFRESH_TOKEN con i permessi Calendar gia' approvati.";
-  }
 
   if (isCalendarReadIntent(text)) {
     const range = getCalendarReadRange(text, env.TIMEZONE || "Europe/Rome");
     const events = await listGoogleCalendarEvents(env, range.start, range.end);
     if (events === null) {
-      return "Non riesco a leggere Google Calendar in questo momento. Controlliamo token e permessi.";
+      return { text: "Non riesco a leggere Google Calendar in questo momento. Controlliamo token e permessi." };
     }
-    return formatGoogleCalendarEvents(events, range.label, env.TIMEZONE || "Europe/Rome");
+    return { text: formatGoogleCalendarEvents(events, range.label, env.TIMEZONE || "Europe/Rome") };
   }
 
   const draft = await parseCalendarEvent(env, text);
   if (draft.intent !== "calendar_create" || draft.confidence < 0.65) {
-    return "Socio, per metterlo in calendario scrivimelo piu' secco: appuntamento: 8 giugno 2026 alle 10 con Nome.";
+    return { text: "Socio, per metterlo in calendario scrivimelo piu' secco: appuntamento: 8 giugno 2026 alle 10 con Nome." };
   }
-  if (!draft.title) return "Mi manca il titolo dell'appuntamento.";
-  if (!draft.start_at) return "Mi manca data o ora dell'appuntamento.";
+  if (!draft.title) return { text: "Mi manca il titolo dell'appuntamento." };
+  if (!draft.start_at) return { text: "Mi manca data o ora dell'appuntamento." };
 
   const startAt = draft.start_at;
   const endAt = draft.end_at || addMinutesIso(startAt, draft.all_day ? 24 * 60 : 60);
-  const googleId = await insertGoogleCalendarEvent(env, {
-    summary: draft.title,
-    description: draft.description,
-    location: draft.location,
-    startAt,
-    endAt,
-    allDay: draft.all_day,
+  const pending = await createPendingAction(env, chatId, "calendar-create", {
+    title: draft.title, startAt, endAt, allDay: draft.all_day, location: draft.location, description: draft.description,
   });
-
-  if (!googleId) {
-    return "Ho capito l'appuntamento, ma Google Calendar non l'ha salvato. Controlliamo refresh token e permessi Calendar.";
-  }
-
-  return `Messo in calendario: ${draft.title}\n${formatCalendarDate(startAt, draft.all_day)}${draft.location ? `\nLuogo: ${draft.location}` : ""}`;
+  return {
+    text: `📅 Confermi?\nTitolo: ${draft.title}\nQuando: ${formatCalendarDate(startAt, draft.all_day)}${draft.location ? `\nLuogo: ${draft.location}` : ""}`,
+    inlineKeyboard: [[{ text: "✅ Crea", callback_data: pending.approveData }, { text: "❌ Annulla", callback_data: pending.rejectData }]],
+  };
 }
 
 function getCalendarReadRange(text: string, timezone: string): { start: string; end: string; label: string } {
@@ -3246,21 +3569,18 @@ function toRomeBoundaryIso(date: Date, timezone: string): string {
 
 async function listGoogleCalendarEvents(env: Env, timeMin: string, timeMax: string): Promise<GoogleCalendarEvent[] | null> {
   try {
-    const token = await getGoogleCalendarAccessToken(env);
-    const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(GOOGLE_CALENDAR_ID)}/events`);
-    url.searchParams.set("singleEvents", "true");
-    url.searchParams.set("orderBy", "startTime");
-    url.searchParams.set("timeMin", timeMin);
-    url.searchParams.set("timeMax", timeMax);
-    url.searchParams.set("maxResults", "20");
-    const response = await fetch(url.toString(), { headers: { authorization: "Bearer " + token } });
+    const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + "/calendar/events";
+    const url = new URL(endpoint);
+    url.searchParams.set("start", timeMin);
+    url.searchParams.set("end", timeMax);
+    const response = await fetch(url.toString(), { headers: { "x-agent-key": env.AGENT_KEY } });
     const raw = await response.text();
     if (!response.ok) {
       console.error("[GCAL] Lettura eventi fallita:", response.status, raw);
       return null;
     }
-    const data = JSON.parse(raw) as { items?: GoogleCalendarEvent[] };
-    return data.items || [];
+    const data = JSON.parse(raw) as { events?: GoogleCalendarEvent[] };
+    return data.events || [];
   } catch (error) {
     console.error("[GCAL] Errore lettura:", error);
     return null;
@@ -3323,79 +3643,6 @@ function cleanJson(text: string): string {
   return start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned;
 }
 
-async function getGoogleCalendarAccessToken(env: Env): Promise<string> {
-  if (googleCalendarAccessToken && googleCalendarAccessToken.expiresAt > Date.now() + 60_000) {
-    return googleCalendarAccessToken.token;
-  }
-  if (!env.GOOGLE_CALENDAR_CLIENT_ID || !env.GOOGLE_CALENDAR_CLIENT_SECRET || !env.GOOGLE_CALENDAR_REFRESH_TOKEN) {
-    throw new Error("Google Calendar OAuth non configurato");
-  }
-
-  const response = await fetch(GOOGLE_TOKEN_URL, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: env.GOOGLE_CALENDAR_CLIENT_ID,
-      client_secret: env.GOOGLE_CALENDAR_CLIENT_SECRET,
-      refresh_token: env.GOOGLE_CALENDAR_REFRESH_TOKEN,
-      grant_type: "refresh_token",
-    }),
-  });
-  const raw = await response.text();
-  if (!response.ok) throw new Error("[GCAL] OAuth refresh fallito: " + response.status + " " + raw);
-  const body = JSON.parse(raw) as { access_token?: string; expires_in?: number };
-  if (!body.access_token) throw new Error("[GCAL] OAuth senza access token");
-  googleCalendarAccessToken = {
-    token: body.access_token,
-    expiresAt: Date.now() + (body.expires_in || 3600) * 1000,
-  };
-  return body.access_token;
-}
-
-async function insertGoogleCalendarEvent(env: Env, event: {
-  summary: string;
-  description?: string | null;
-  location?: string | null;
-  startAt: string;
-  endAt: string;
-  allDay?: boolean;
-}): Promise<string | null> {
-  try {
-    const token = await getGoogleCalendarAccessToken(env);
-    const body: Record<string, unknown> = { summary: event.summary };
-    if (event.description) body.description = event.description;
-    if (event.location) body.location = event.location;
-    if (event.allDay) {
-      body.start = { date: event.startAt.slice(0, 10) };
-      body.end = { date: event.endAt.slice(0, 10) };
-    } else {
-      body.start = { dateTime: event.startAt, timeZone: env.TIMEZONE || "Europe/Rome" };
-      body.end = { dateTime: event.endAt, timeZone: env.TIMEZONE || "Europe/Rome" };
-    }
-
-    const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(GOOGLE_CALENDAR_ID)}/events`, {
-      method: "POST",
-      headers: {
-        authorization: "Bearer " + token,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
-
-    const raw = await response.text();
-    if (!response.ok) {
-      console.error("[GCAL] Scrittura evento fallita:", response.status, raw);
-      return null;
-    }
-    const data = JSON.parse(raw) as { id?: string };
-    console.log("[GCAL] Evento creato:", data.id);
-    return data.id || null;
-  } catch (error) {
-    console.error("[GCAL] Errore scrittura:", error);
-    return null;
-  }
-}
-
 function addMinutesIso(value: string, minutes: number): string {
   const date = new Date(value);
   date.setMinutes(date.getMinutes() + minutes);
@@ -3407,60 +3654,6 @@ function formatCalendarDate(value: string, allDay?: boolean): string {
   return allDay
     ? date.toLocaleDateString("it-IT", { timeZone: "Europe/Rome", dateStyle: "full" })
     : date.toLocaleString("it-IT", { timeZone: "Europe/Rome", dateStyle: "full", timeStyle: "short" });
-}
-
-function redirectToGoogleOAuth(req: Request, env: Env): Response {
-  if (!env.GOOGLE_CALENDAR_CLIENT_ID) return new Response("GOOGLE_CALENDAR_CLIENT_ID mancante", { status: 500 });
-  const requestUrl = new URL(req.url);
-  const redirectUri = `${requestUrl.origin}/auth/callback`;
-  const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
-  url.searchParams.set("client_id", env.GOOGLE_CALENDAR_CLIENT_ID);
-  url.searchParams.set("redirect_uri", redirectUri);
-  url.searchParams.set("scope", GOOGLE_CALENDAR_SCOPE);
-  url.searchParams.set("access_type", "offline");
-  url.searchParams.set("response_type", "code");
-  url.searchParams.set("prompt", "consent");
-  return Response.redirect(url.toString(), 302);
-}
-
-async function handleGoogleOAuthCallback(req: Request, env: Env): Promise<Response> {
-  if (!env.GOOGLE_CALENDAR_CLIENT_ID || !env.GOOGLE_CALENDAR_CLIENT_SECRET) {
-    return new Response("Google OAuth client non configurato", { status: 500 });
-  }
-  const requestUrl = new URL(req.url);
-  const code = requestUrl.searchParams.get("code");
-  if (!code) return new Response("code mancante", { status: 400 });
-  const redirectUri = `${requestUrl.origin}/auth/callback`;
-  const response = await fetch(GOOGLE_TOKEN_URL, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: env.GOOGLE_CALENDAR_CLIENT_ID,
-      client_secret: env.GOOGLE_CALENDAR_CLIENT_SECRET,
-      code,
-      grant_type: "authorization_code",
-      redirect_uri: redirectUri,
-    }),
-  });
-  const raw = await response.text();
-  if (!response.ok) return new Response("OAuth error: " + raw, { status: 500 });
-  const data = JSON.parse(raw) as { refresh_token?: string };
-  const refreshToken = data.refresh_token || "";
-  return new Response(`<!DOCTYPE html>
-<html>
-<head><title>OAuth Success</title></head>
-<body>
-  <h1>Autorizzazione completata</h1>
-  <p>Copia questo refresh token e salvalo con:</p>
-  <pre>npx wrangler secret put GOOGLE_CALENDAR_REFRESH_TOKEN</pre>
-  <textarea readonly style="width:100%;height:120px" onclick="this.select()">${escapeHtml(refreshToken)}</textarea>
-  <p><strong>Attenzione:</strong> questo token e' visibile solo ora. Se lo perdi, rifai il flusso.</p>
-</body>
-</html>`, { headers: { "content-type": "text/html; charset=utf-8" } });
-}
-
-function escapeHtml(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 // ===== Fase 1: signal bus + digest mattutino =====
