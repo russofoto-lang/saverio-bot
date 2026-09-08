@@ -19,11 +19,14 @@ interface Env {
   TASK_URL: string;
   AGENT_KEY: string;
   APIFY_TOKEN?: string;
+  GEMINI_API_KEY?: string;
   DIGEST_ENABLED?: string;
   GOOGLE_SERVICE_ACCOUNT_JSON?: string;
   GOOGLE_CALENDAR_CLIENT_ID?: string;
   GOOGLE_CALENDAR_CLIENT_SECRET?: string;
   GOOGLE_CALENDAR_REFRESH_TOKEN?: string;
+  // Base URL di blocnotes-ai, che espone /append-history.
+  BLOCNOTES_AI_URL?: string;
   TIMEZONE?: string;
 }
 
@@ -47,17 +50,69 @@ const DEEP_DIVE_STEPS = ["resolve", "instagram", "website", "web-mentions", "syn
 const APIFY_INSTAGRAM_POST_ACTOR = "apify~instagram-post-scraper";
 const DEEP_DIVE_POST_LIMIT = 30;
 const DEEP_DIVE_INPUT_TTL = 60 * 5;
+const DEEP_DIVE_STALL_MS = 30 * 60 * 1000;
+const DEEP_DIVE_WEBSITE_PAGE_TEXT_LIMIT = 3_000;
+const DEEP_DIVE_WEBSITE_TOTAL_TEXT_LIMIT = 18_000;
+const CLAUDE_SONNET_INPUT_USD_PER_MTOKEN = 3;
+const CLAUDE_SONNET_OUTPUT_USD_PER_MTOKEN = 15;
+const CLAUDE_WEB_SEARCH_USD = 0.01;
+const PENDING_ACTION_TTL = 60 * 60 * 24 * 7;
+const GEMINI_EMBEDDING_MODEL = "gemini-embedding-001";
+const GEMINI_EMBEDDING_DIMENSIONS = 768;
 const MENU_INDAGA = "🔎 Indaga";
 const MENU_LAVORI = "📋 Lavori";
+const MENU_AUDIT_LEGACY = "🏷️ Audit Legacy";
 const MENU_MEMORIA = "🧠 Memoria";
 const MENU_OGGI = "📅 Oggi";
 const MENU_NUOVO = "↩️ Nuova chat";
 const MENU_RESET = "🧹 Reset";
 const MENU_AIUTO = "❓ Aiuto";
+const BOT_HELP_TEXT = `COME USARE SAVERIO
+
+Parlami normalmente: posso aiutarti a decidere su lavoro, clienti, preventivi, attrezzatura, social ed eventi. Quando serve cerco anche sul web.
+
+🔎 INDAGA
+Tocca Indaga, poi manda @handle Instagram o URL del sito.
+Esempio: /indaga @nomeprofilo
+Ricevi un report competitivo su Instagram, sito e presenza web.
+
+COSTI
+Scrivi /costi per vedere consumi e stima Claude degli ultimi 30 giorni.
+
+📋 LAVORI E CLIENTI
+• “Ricordiamoci di mandare il preventivo a Luca entro venerdì”
+• “Lavori aperti”
+• “Ho finito l’album di Rossi”
+• “Fammi il punto sul cliente Rossi”
+
+📅 AGENDA E PROMEMORIA
+• “Cosa ho oggi?” oppure “Agenda domani”
+• “Appuntamento: 8 giugno alle 10 con Mario”
+• “Ricordami tra un’ora di mandare una email”
+
+✉️ EMAIL — sola lettura
+• “Mostrami le ultime 10 email”
+• “Cerca email da Mario Rossi”
+• “Trova email sul preventivo di Laura”
+• “Cercami nelle ultime 30 email se sono iscritto a newsletter”
+
+🔗 LINK E LETTURE
+• Inviami un link pubblico: lo riassumo e lo salvo.
+• “Cosa abbiamo salvato su ChatGPT Work?”
+• “Cerca tra le letture qualcosa sul marketing”
+
+🧠 MEMORIA
+Tocca Memoria per vedere i ricordi salvati. Puoi scrivere “segna” dopo una decisione importante per proporti il salvataggio.
+
+⚙️ PULSANTI
+• Oggi: priorità, lavori e agenda.
+• Nuova chat / Reset: cancella il filo della conversazione corrente, non i dati salvati.
+• Quando vedi ✅ / ❌, l’azione viene eseguita solo dopo la tua approvazione.`;
 const MAIN_MENU = {
   keyboard: [
     [{ text: MENU_INDAGA }, { text: MENU_LAVORI }],
     [{ text: MENU_MEMORIA }, { text: MENU_OGGI }],
+    [{ text: MENU_AUDIT_LEGACY }],
     [{ text: MENU_NUOVO }, { text: MENU_RESET }, { text: MENU_AIUTO }],
   ],
   resize_keyboard: true,
@@ -112,6 +167,25 @@ export default {
     }
 
     const update = await req.json() as any;
+    const callbackQuery = update.callback_query;
+    if (callbackQuery) {
+      const callbackChatId = callbackQuery.message?.chat?.id;
+      const callbackUserId = callbackQuery.from?.id;
+      if (!callbackChatId || !callbackUserId) return new Response("ok");
+      if (ALLOWED_USER_ID && callbackUserId !== ALLOWED_USER_ID) {
+        await answerCallbackQuery(env, callbackQuery.id, "Azione non autorizzata.");
+        return new Response("ok");
+      }
+      try {
+        const reply = await handlePendingActionCallback(env, callbackChatId, String(callbackQuery.data ?? ""));
+        await answerCallbackQuery(env, callbackQuery.id, reply);
+      } catch (error) {
+        console.error("[FASE-3] Callback Telegram fallita:", error);
+        await answerCallbackQuery(env, callbackQuery.id, "Azione non riuscita. Riprova.");
+      }
+      return new Response("ok");
+    }
+
     const msg = update.message;
     if (!msg?.text) return new Response("ok"); // ignora foto, sticker, ecc.
 
@@ -124,17 +198,24 @@ export default {
       return new Response("ok");
     }
 
+    const regularizeReply = await handleRegularizeInput(env, chatId, text);
+    if (regularizeReply) {
+      await sendMessage(env, chatId, regularizeReply);
+      return new Response("ok");
+    }
+
     if (text === MENU_INDAGA) {
       await env.SAVERIO_KV.put(deepDiveInputKey(chatId), "1", { expirationTtl: DEEP_DIVE_INPUT_TTL });
       await sendMessage(env, chatId, "Mandami l'@handle Instagram o l'URL del sito da analizzare.", { menu: true });
       return new Response("ok");
     }
     if (text === MENU_AIUTO) {
-      await sendMessage(env, chatId, "Tocca un tasto oppure scrivimi normalmente. Per un concorrente: Indaga, poi @handle o URL.", { menu: true });
+      await sendMessage(env, chatId, BOT_HELP_TEXT, { menu: true });
       return new Response("ok");
     }
     if (text === MENU_MEMORIA) text = "/memoria";
-    if (text === MENU_LAVORI) text = "lavori aperti";
+    if (text === MENU_LAVORI) text = "/lavori";
+    if (text === MENU_AUDIT_LEGACY) text = "/auditlegacy";
     if (text === MENU_OGGI) text = "cosa devo fare oggi";
     if (text === MENU_NUOVO) text = "/nuovo";
     if (text === MENU_RESET) text = "/reset";
@@ -156,6 +237,36 @@ export default {
       await sendMessage(env, chatId, formatMemoryList(memories));
       return new Response("ok");
     }
+    if (text === "/costi") {
+      await sendMessage(env, chatId, await formatDeepDiveCostSummary(env));
+      return new Response("ok");
+    }
+    if (text.toLowerCase() === "/lavori") {
+      try {
+        const { ranking } = await getArretratiRanking(env);
+        await sendMessage(env, chatId, formatArretratiRanking(ranking));
+      } catch (error) {
+        console.error("[ARRETRATI] /Lavori fallito:", error);
+        await sendMessage(env, chatId, "Non riesco a leggere gli arretrati in questo momento. Riprova tra poco.");
+      }
+      return new Response("ok");
+    }
+    if (text.toLowerCase() === "/auditlegacy") {
+      try {
+        const candidates = await getLegacyAuditCandidates(env);
+        if (!candidates.length) {
+          await sendMessage(env, chatId, "🏷️ AUDIT LEGACY\n\nNessuna scheda lavoro ferma da oltre 60 giorni senza Storico valido.");
+          return new Response("ok");
+        }
+        const pending = await createPendingAction(env, chatId, "arretrati-audit-tag", { notes: candidates.map((note) => ({ id: note.id, title: note.title, text: note.text })) });
+        const lines = ["🏷️ AUDIT LEGACY", "", `Trovate ${candidates.length} schede da regolarizzare:`, ...candidates.map((note) => `• ${note.title} — ultima modifica ${formatAuditDate(note.lastModifiedAt)} — ${note.auditReason}`)];
+        await sendMessage(env, chatId, lines.join("\n"), { inlineKeyboard: [[{ text: "🏷️ Taggale tutte come #daregolarizzare", callback_data: pending.approveData }]] });
+      } catch (error) {
+        console.error("[ARRETRATI] Audit legacy fallito:", error);
+        await sendMessage(env, chatId, "Non riesco a completare l'audit legacy in questo momento. Riprova tra poco.");
+      }
+      return new Response("ok");
+    }
     if (text === "/start") {
       await sendMessage(env, chatId, "Sono Saverio. Dimmi su cosa devi decidere.");
       return new Response("ok");
@@ -170,7 +281,7 @@ export default {
       }
 
       const job = await createDeepDiveJob(env, chatId, deepDiveTarget);
-      const reply = `Indagine su «${job.target}» avviata. Ti mando il report tra qualche minuto.`;
+      const reply = `🔍 Indagine su «${job.target}» avviata. Report tra qualche minuto.`;
       await appendHistory(env, chatId, [
         { role: "user", content: text },
         { role: "assistant", content: reply },
@@ -182,12 +293,22 @@ export default {
     if (await env.SAVERIO_KV.get(deepDiveInputKey(chatId))) {
       await env.SAVERIO_KV.delete(deepDiveInputKey(chatId));
       const job = await createDeepDiveJob(env, chatId, text);
-      const reply = `Indagine su "${job.target}" avviata. Ti mando il report tra qualche minuto.`;
+      const reply = `🔍 Indagine su «${job.target}» avviata. Report tra qualche minuto.`;
       await appendHistory(env, chatId, [
         { role: "user", content: text },
         { role: "assistant", content: reply },
       ]);
       await sendMessage(env, chatId, reply, { menu: true });
+      return new Response("ok");
+    }
+
+    const readReply = await gestisciLinkInbox(env, text);
+    if (readReply) {
+      await appendHistory(env, chatId, [
+        { role: "user", content: text },
+        { role: "assistant", content: readReply },
+      ]);
+      await sendMessage(env, chatId, readReply);
       return new Response("ok");
     }
 
@@ -218,6 +339,26 @@ export default {
         { role: "assistant", content: clientBriefReply },
       ]);
       await sendMessage(env, chatId, clientBriefReply);
+      return new Response("ok");
+    }
+
+    const emailReply = await gestisciEmail(env, text);
+    if (emailReply) {
+      await appendHistory(env, chatId, [
+        { role: "user", content: text },
+        { role: "assistant", content: emailReply },
+      ]);
+      await sendMessage(env, chatId, emailReply);
+      return new Response("ok");
+    }
+
+    const readsReply = await gestisciReadsSearch(env, text);
+    if (readsReply) {
+      await appendHistory(env, chatId, [
+        { role: "user", content: text },
+        { role: "assistant", content: readsReply },
+      ]);
+      await sendMessage(env, chatId, readsReply);
       return new Response("ok");
     }
 
@@ -270,8 +411,11 @@ export default {
 
     let reply: string;
     try {
-      const memories = await loadRelevantMemories(env, chatId, text);
-      reply = await askClaude(env, history, memories);
+      const [memories, reads] = await Promise.all([
+        loadRelevantMemories(env, chatId, text),
+        loadRelevantReads(env, text),
+      ]);
+      reply = await askClaude(env, history, memories, reads);
     } catch (e) {
       await sendMessage(env, chatId, "Problema tecnico nel ragionamento. Riprova tra un attimo.");
       return new Response("ok");
@@ -284,19 +428,18 @@ export default {
     return new Response("ok");
   },
 async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
-    if (event.cron === "* * * * *") {
-      await processDuePromemoria(env);
-      await processNextDeepDiveJob(env);
-      return;
-    }
-
-    if (event.cron === "25 5 * * *") {
-      try {
-        await fetch(env.TASK_URL + "/open", { method: "GET" });
-        console.log("[FASE-1] Warm-up ping a sm-backend inviato.");
-      } catch (e) {
-        console.error("[FASE-1] Warm-up ping fallito:", e);
+    if (event.cron === "*/2 * * * *") {
+      if (isWeeklyLearningConsolidationTime(new Date())) {
+        await runWeeklyLearningConsolidation(env);
+        return;
       }
+      await processDuePromemoria(env);
+      const hasPendingJobs = await env.SAVERIO_KV.get(DEEP_DIVE_PENDING_FLAG_KEY);
+      if (!hasPendingJobs) {
+        console.log("[FASE-2] Nessun job /indaga pendente: scansione coda saltata.");
+        return;
+      }
+      await processNextDeepDiveJob(env);
       return;
     }
 
@@ -318,7 +461,45 @@ type DeepDiveStepResult = {
   completedAt: string;
   [key: string]: unknown;
 };
+type DeepDiveStepExecution = { durationMs: number; retries: number; error: string | null };
+type DeepDiveUsage = {
+  anthropicRequests: number;
+  anthropicInputTokens: number;
+  anthropicOutputTokens: number;
+  anthropicWebSearches: number;
+  geminiEmbeddings: number;
+  firestoreReads: number;
+  firestoreWrites: number;
+  apifyRuns: number;
+  apifyHttpRequests: number;
+  websiteFetches: number;
+};
+type DeepDiveTiming = { queueWaitMs: number | null; activeWallMs: number; endToEndMs: number | null };
+type LearningSkill = {
+  id: string;
+  title: string;
+  content: string;
+  embedding: number[];
+  helpfulCount: number;
+  harmfulCount: number;
+  usageCount: number;
+};
+type LearningLesson = { id: string; trigger: string; rule: string; embedding: number[] };
+type DeepDiveLearningContext = {
+  skill: Pick<LearningSkill, "id" | "title" | "content"> | null;
+  lessons: Array<Pick<LearningLesson, "id" | "trigger" | "rule">>;
+};
+type DeepDiveReflection = {
+  skill: { title: string; content: string } | null;
+  lessons: Array<{ trigger: string; rule: string }>;
+  skillVerdict: "utile" | "inutile" | "dannosa" | null;
+};
+type WeeklyLearningProposal = {
+  merges: Array<{ lessonIds: string[]; trigger: string; rule: string }>;
+  quarantines: Array<{ skillId: string; reason: string }>;
+};
 type DeepDiveJob = {
+  id: string;
   type: "deep-dive";
   target: string;
   chatId: number;
@@ -326,9 +507,26 @@ type DeepDiveJob = {
   currentStep: number;
   steps: DeepDiveStep[];
   results: Partial<Record<DeepDiveStep, DeepDiveStepResult>>;
+  retryCounts: Partial<Record<DeepDiveStep, number>>;
+  stepExecutions: Partial<Record<DeepDiveStep, DeepDiveStepExecution>>;
+  learningContext: DeepDiveLearningContext;
+  queueKey: string;
+  usage: DeepDiveUsage;
+  timing: DeepDiveTiming;
   createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
   completedAt?: string;
   error: string | null;
+};
+type TelegramInlineButton = { text: string; callback_data: string };
+type PendingActionType = "task-open" | "skill-merge" | "skill-quarantine" | "arretrati-log-event" | "arretrati-suspend" | "arretrati-retry" | "arretrati-audit-tag";
+type PendingAction = {
+  action: PendingActionType;
+  params: JsonValue;
+  chatId: number;
+  createdAt: string;
+  expiresAt: string;
 };
 type LongMemory = {
   id: string;
@@ -341,16 +539,81 @@ type LongMemory = {
 const historyKey = (chatId: number) => `hist:${chatId}`;
 const longMemoryKey = (chatId: number) => `long_memory:${chatId}`;
 const deepDiveJobKey = (id: string) => `job:${id}`;
+const deepDiveQueueKey = (createdAt: string, id: string) => `queue:deep-dive:${createdAt}:${id}`;
+const DEEP_DIVE_PENDING_FLAG_KEY = "has-pending-jobs";
 const deepDiveInputKey = (chatId: number) => `pending_indaga:${chatId}`;
+const pendingActionKey = (id: string) => `pending:${id}`;
 
 function getDeepDiveTarget(text: string): string | null {
   const match = text.match(/^\/indaga(?:@\w+)?(?:\s+([\s\S]+))?$/i);
   return match ? (match[1]?.trim() ?? "") : null;
 }
 
+function emptyDeepDiveUsage(): DeepDiveUsage {
+  return {
+    anthropicRequests: 0,
+    anthropicInputTokens: 0,
+    anthropicOutputTokens: 0,
+    anthropicWebSearches: 0,
+    geminiEmbeddings: 0,
+    firestoreReads: 0,
+    firestoreWrites: 0,
+    apifyRuns: 0,
+    apifyHttpRequests: 0,
+    websiteFetches: 0,
+  };
+}
+
+function refreshDeepDiveTiming(job: DeepDiveJob): void {
+  job.timing.activeWallMs = Object.values(job.stepExecutions)
+    .reduce((sum, execution) => sum + (execution?.durationMs ?? 0), 0);
+  job.timing.queueWaitMs = job.startedAt
+    ? Math.max(0, Date.parse(job.startedAt) - Date.parse(job.createdAt))
+    : null;
+  job.timing.endToEndMs = job.completedAt
+    ? Math.max(0, Date.parse(job.completedAt) - Date.parse(job.createdAt))
+    : null;
+}
+
+function estimateClaudeUsd(usage: DeepDiveUsage): number {
+  return Math.round((
+    (usage.anthropicInputTokens / 1_000_000) * CLAUDE_SONNET_INPUT_USD_PER_MTOKEN
+    + (usage.anthropicOutputTokens / 1_000_000) * CLAUDE_SONNET_OUTPUT_USD_PER_MTOKEN
+    + usage.anthropicWebSearches * CLAUDE_WEB_SEARCH_USD
+  ) * 10000) / 10000;
+}
+
+function recordClaudeUsage(usage: DeepDiveUsage | undefined, data: RawRecord): void {
+  if (!usage) return;
+  const apiUsage = asRecord(data.usage);
+  const serverToolUse = asRecord(apiUsage.server_tool_use);
+  usage.anthropicRequests += 1;
+  usage.anthropicInputTokens += asNumber(apiUsage.input_tokens) ?? 0;
+  usage.anthropicOutputTokens += asNumber(apiUsage.output_tokens) ?? 0;
+  usage.anthropicWebSearches += asNumber(serverToolUse.web_search_requests) ?? 0;
+}
+
+function claudeTextContent(data: RawRecord): string {
+  const content = Array.isArray(data.content) ? data.content.filter(isRecord) : [];
+  return content
+    .filter((block) => asString(block.type) === "text")
+    .map((block) => asString(block.text) ?? "")
+    .join("\n")
+    .trim();
+}
+
+function isWeeklyLearningConsolidationTime(now: Date): boolean {
+  return now.getUTCDay() === 0 && now.getUTCHours() === 6 && now.getUTCMinutes() === 0;
+}
+
 async function createDeepDiveJob(env: Env, chatId: number, target: string): Promise<DeepDiveJob> {
   const id = crypto.randomUUID();
+  const usage = emptyDeepDiveUsage();
+  const learningContext = await loadDeepDiveLearningContext(env, target, usage);
+  const createdAt = new Date().toISOString();
+  const queueKey = deepDiveQueueKey(createdAt, id);
   const job: DeepDiveJob = {
+    id,
     type: "deep-dive",
     target,
     chatId,
@@ -358,78 +621,690 @@ async function createDeepDiveJob(env: Env, chatId: number, target: string): Prom
     currentStep: 0,
     steps: [...DEEP_DIVE_STEPS],
     results: {},
-    createdAt: new Date().toISOString(),
+    retryCounts: {},
+    stepExecutions: {},
+    learningContext,
+    queueKey,
+    usage,
+    timing: { queueWaitMs: null, activeWallMs: 0, endToEndMs: null },
+    createdAt,
+    updatedAt: createdAt,
     error: null,
   };
   await env.SAVERIO_KV.put(deepDiveJobKey(id), JSON.stringify(job), { expirationTtl: DEEP_DIVE_JOB_TTL });
+  await env.SAVERIO_KV.put(queueKey, deepDiveJobKey(id), { expirationTtl: DEEP_DIVE_JOB_TTL });
+  await env.SAVERIO_KV.put(DEEP_DIVE_PENDING_FLAG_KEY, "1");
   console.log(`[FASE-2] Job ${id} creato per ${target}.`);
   return job;
 }
 
 async function processNextDeepDiveJob(env: Env): Promise<void> {
-  const jobs = await env.SAVERIO_KV.list({ prefix: "job:", limit: 100 });
+  const queueEntries = await env.SAVERIO_KV.list({ prefix: "queue:deep-dive:", limit: 100 });
 
-  for (const key of jobs.keys) {
-    const raw = await env.SAVERIO_KV.get(key.name);
-    if (!raw) continue;
+  for (const entry of queueEntries.keys) {
+    const jobKey = await env.SAVERIO_KV.get(entry.name);
+    if (!jobKey) {
+      await env.SAVERIO_KV.delete(entry.name);
+      continue;
+    }
+    const raw = await env.SAVERIO_KV.get(jobKey);
+    if (!raw) {
+      await env.SAVERIO_KV.delete(entry.name);
+      continue;
+    }
 
     let job: DeepDiveJob;
     try {
       job = JSON.parse(raw) as DeepDiveJob;
     } catch (error) {
-      console.error(`[FASE-2] Job non leggibile ${key.name}:`, error);
+      console.error(`[FASE-2] Job non leggibile ${jobKey}:`, error);
+      await env.SAVERIO_KV.delete(entry.name);
       continue;
     }
 
-    if (job.type !== "deep-dive" || (job.status !== "pending" && job.status !== "running")) continue;
-    await runOneDeepDiveStep(env, key.name, job);
+    job.id ||= jobKey.slice("job:".length);
+    job.retryCounts ??= {};
+    job.stepExecutions ??= {};
+    job.learningContext ??= { skill: null, lessons: [] };
+    job.queueKey ??= entry.name;
+    job.usage ??= emptyDeepDiveUsage();
+    job.timing ??= { queueWaitMs: null, activeWallMs: 0, endToEndMs: null };
+
+    if (job.type !== "deep-dive" || (job.status !== "pending" && job.status !== "running")) {
+      await env.SAVERIO_KV.delete(entry.name);
+      continue;
+    }
+
+    if (job.status === "running" && isDeepDiveStalled(job)) {
+      console.log(`[FASE-2] ${job.target}: job stalled over 30 minutes, resuming current step.`);
+    }
+    const jobFinished = await runOneDeepDiveStep(env, jobKey, job);
+    if (jobFinished) {
+      await clearDeepDivePendingFlagIfQueueEmpty(env);
+    }
     return;
+  }
+
+  await env.SAVERIO_KV.delete(DEEP_DIVE_PENDING_FLAG_KEY);
+}
+
+async function clearDeepDivePendingFlagIfQueueEmpty(env: Env): Promise<void> {
+  const remaining = await env.SAVERIO_KV.list({ prefix: "queue:deep-dive:", limit: 1 });
+  if (!remaining.keys.length) {
+    await env.SAVERIO_KV.delete(DEEP_DIVE_PENDING_FLAG_KEY);
+    console.log("[FASE-2] Coda /indaga vuota: flag has-pending-jobs rimosso.");
   }
 }
 
-async function runOneDeepDiveStep(env: Env, key: string, job: DeepDiveJob): Promise<void> {
+async function runOneDeepDiveStep(env: Env, key: string, job: DeepDiveJob): Promise<boolean> {
   const step = job.steps[job.currentStep];
   if (!step) {
     job.status = "done";
     job.completedAt = new Date().toISOString();
+    refreshDeepDiveTiming(job);
     await saveDeepDiveJob(env, key, job);
-    return;
+    await removeDeepDiveFromQueue(env, job);
+    return true;
   }
 
+  const startedAt = Date.now();
   try {
     job.status = "running";
+    job.startedAt ??= new Date().toISOString();
+    refreshDeepDiveTiming(job);
     job.results[step] = await runDeepDiveStep(env, job, step);
     job.currentStep += 1;
+    job.error = null;
+    const retries = job.retryCounts[step] ?? 0;
+    job.retryCounts[step] = 0;
+    job.stepExecutions[step] = {
+      durationMs: (job.stepExecutions[step]?.durationMs ?? 0) + Date.now() - startedAt,
+      retries,
+      error: null,
+    };
 
     if (job.currentStep === job.steps.length) {
+      const report = asString(job.results.synthesize?.report);
+      if (!report) throw new Error("sintesi del report non disponibile");
+      await createFirestoreDeepDiveReport(env, job, report);
       job.status = "done";
       job.completedAt = new Date().toISOString();
+      refreshDeepDiveTiming(job);
     }
 
     await saveDeepDiveJob(env, key, job);
     console.log(`[FASE-2] ${job.target}: step ${step} completato.`);
 
     if (job.status === "done") {
-      await sendMessage(env, job.chatId, formatDeepDiveCompletion(job));
+      await removeDeepDiveFromQueue(env, job);
+      try {
+        await sendDeepDiveCompletion(env, job);
+      } catch (sendError) {
+        console.error(`[FASE-2] ${job.target}: invio del report Telegram fallito:`, sendError);
+      }
+      await reflectDeepDiveJob(env, job, "done").catch((reflectionError) => {
+        console.error(`[FASE-3] Riflessione fallita per ${job.target}:`, reflectionError);
+      });
+      await writeDeepDiveEpisode(env, job, "done", null).catch((episodeError) => {
+        console.error(`[FASE-3] Episodio non salvato per ${job.target}:`, episodeError);
+      });
     }
+    return job.status === "done";
   } catch (error) {
-    job.status = "failed";
     job.error = error instanceof Error ? error.message : String(error);
+    const attempts = (job.retryCounts[step] ?? 0) + 1;
+    job.retryCounts[step] = attempts;
+    job.stepExecutions[step] = {
+      durationMs: (job.stepExecutions[step]?.durationMs ?? 0) + Date.now() - startedAt,
+      retries: attempts,
+      error: job.error,
+    };
+    job.status = attempts >= 3 ? "failed" : "running";
     await saveDeepDiveJob(env, key, job);
     console.error(`[FASE-2] ${job.target}: step ${step} fallito:`, error);
-    await sendMessage(env, job.chatId, `Indagine su «${job.target}» interrotta allo step ${step}.`);
+    if (job.status === "failed") {
+      job.completedAt = new Date().toISOString();
+      refreshDeepDiveTiming(job);
+      await saveDeepDiveJob(env, key, job);
+      await removeDeepDiveFromQueue(env, job);
+      await sendMessage(env, job.chatId, `Indagine su «${job.target}» fallita allo step ${step}: ${job.error}`);
+      await reflectDeepDiveJob(env, job, "failed").catch((reflectionError) => {
+        console.error(`[FASE-3] Riflessione fallita per ${job.target}:`, reflectionError);
+      });
+      await writeDeepDiveEpisode(env, job, "failed", step).catch((episodeError) => {
+        console.error(`[FASE-3] Episodio non salvato per ${job.target}:`, episodeError);
+      });
+      return true;
+    } else {
+      console.log(`[FASE-2] ${job.target}: step ${step} scheduled for retry (${attempts}/3).`);
+      return false;
+    }
   }
 }
 
 async function runDeepDiveStep(env: Env, job: DeepDiveJob, step: DeepDiveStep): Promise<DeepDiveStepResult> {
-  if (step === "resolve") return resolveDeepDiveTarget(env, job.target);
+  if (step === "resolve") return resolveDeepDiveTarget(env, job.target, job.learningContext, job.usage);
   if (step === "instagram") return runInstagramDeepDive(env, job);
   if (step === "website") return runWebsiteDeepDive(job);
   if (step === "web-mentions") return runWebMentionsDeepDive(env, job);
-  return runDeepDivePlaceholderStep(step);
+  return runSynthesizeDeepDive(env, job);
 }
 
-async function resolveDeepDiveTarget(env: Env, target: string): Promise<DeepDiveStepResult> {
+async function removeDeepDiveFromQueue(env: Env, job: DeepDiveJob): Promise<void> {
+  if (!job.queueKey) return;
+  await env.SAVERIO_KV.delete(job.queueKey).catch((error) => {
+    console.error(`[FASE-2] Rimozione coda fallita per ${job.target}:`, error);
+  });
+}
+
+function isDeepDiveStalled(job: DeepDiveJob): boolean {
+  const lastActivity = Date.parse(job.updatedAt || job.startedAt || job.createdAt);
+  return Number.isFinite(lastActivity) && Date.now() - lastActivity > DEEP_DIVE_STALL_MS;
+}
+
+async function loadDeepDiveLearningContext(env: Env, target: string, usage: DeepDiveUsage): Promise<DeepDiveLearningContext> {
+  const empty: DeepDiveLearningContext = { skill: null, lessons: [] };
+  if (!env.GEMINI_API_KEY) {
+    console.log("[FASE-3] iniettate: skill=nessuna lessons=0 (GEMINI_API_KEY mancante).");
+    return empty;
+  }
+  try {
+    const queryEmbedding = await createGeminiEmbedding(env, target, "RETRIEVAL_QUERY", usage);
+    const [skills, lessons] = await Promise.all([
+      listLearningSkills(env, usage),
+      listLearningLessons(env, usage),
+    ]);
+    const skill = skills
+      .filter((candidate) => candidate.harmfulCount < 2)
+      .map((candidate) => ({ candidate, score: cosineSimilarity(queryEmbedding, candidate.embedding) }))
+      .filter(({ score }) => score >= 0.75)
+      .sort((left, right) => right.score - left.score)[0]?.candidate ?? null;
+    const selectedLessons = lessons
+      .map((candidate) => ({ candidate, score: cosineSimilarity(queryEmbedding, candidate.embedding) }))
+      .filter(({ score }) => score >= 0.70)
+      .sort((left, right) => right.score - left.score)
+      .slice(0, 3)
+      .map(({ candidate }) => ({ id: candidate.id, trigger: candidate.trigger, rule: candidate.rule }));
+
+    if (skill) {
+      await incrementSkillUsage(env, skill, usage).catch((error) => {
+        console.error(`[FASE-3] Aggiornamento usage skill ${skill.id} fallito:`, error);
+      });
+    }
+    console.log(`[FASE-3] iniettate: skill=${skill?.title ?? "nessuna"} lessons=${selectedLessons.length}.`);
+    return {
+      skill: skill ? { id: skill.id, title: skill.title, content: skill.content } : null,
+      lessons: selectedLessons,
+    };
+  } catch (error) {
+    console.error("[FASE-3] Retrieval learning context fallito:", error);
+    return empty;
+  }
+}
+
+function formatDeepDiveLearningContext(context: DeepDiveLearningContext): string {
+  const parts: string[] = [];
+  if (context.skill) parts.push(`Procedura appresa da task precedenti (${context.skill.title}):\n${context.skill.content}`);
+  if (context.lessons.length) {
+    parts.push(`Errori noti da evitare:\n${context.lessons.map((lesson) => `- Quando ${lesson.trigger}: ${lesson.rule}`).join("\n")}`);
+  }
+  return parts.length ? parts.join("\n\n") : "Nessuna conoscenza precedente pertinente disponibile.";
+}
+
+async function createGeminiEmbedding(
+  env: Env,
+  text: string,
+  taskType: "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY",
+  usage?: DeepDiveUsage,
+): Promise<number[]> {
+  if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY mancante");
+  if (usage) usage.geminiEmbeddings += 1;
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_EMBEDDING_MODEL}:embedContent`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+      body: JSON.stringify({
+        taskType,
+        outputDimensionality: GEMINI_EMBEDDING_DIMENSIONS,
+        content: { parts: [{ text: text.slice(0, 12_000) }] },
+      }),
+    },
+  );
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`Gemini embedding ${response.status}: ${raw}`);
+  const data = asRecord(JSON.parse(raw));
+  const values = asNumberArray(asRecord(data.embedding).values);
+  if (values.length !== GEMINI_EMBEDDING_DIMENSIONS) throw new Error(`Embedding Gemini dimensioni inattese: ${values.length}`);
+  return normalizeEmbedding(values);
+}
+
+async function reflectDeepDiveJob(env: Env, job: DeepDiveJob, outcome: "done" | "failed"): Promise<void> {
+  if (!env.GEMINI_API_KEY) return;
+  const reflection = await askClaudeForDeepDiveReflection(env, job, outcome, job.usage);
+  const lessons = (reflection.lessons.length ? reflection.lessons : fallbackDeepDiveLessons(job, outcome)).slice(0, 3);
+  for (const lesson of lessons) await createFirestoreLesson(env, lesson, job.usage);
+
+  if (job.learningContext.skill && reflection.skillVerdict) {
+    await applySkillVerdict(env, job.learningContext.skill.id, reflection.skillVerdict, job.usage);
+  }
+  if (!reflection.skill || outcome !== "done") return;
+
+  if (job.learningContext.skill && (reflection.skillVerdict === "utile" || reflection.skillVerdict === "inutile")) {
+    await reviseFirestoreSkill(env, job.learningContext.skill.id, reflection.skill, job.usage);
+  } else if (!job.learningContext.skill) {
+    await createFirestoreSkill(env, reflection.skill, job.usage);
+  }
+}
+
+function fallbackDeepDiveLessons(job: DeepDiveJob, outcome: "done" | "failed"): Array<{ trigger: string; rule: string }> {
+  if (outcome !== "failed") return [];
+  const failedStep = job.steps[job.currentStep] ?? "sconosciuto";
+  return [{
+    trigger: `lo step ${failedStep} fallisce dopo i retry`,
+    rule: `conserva gli step già completati e verifica l'errore: ${job.error ?? "dettaglio non disponibile"}`,
+  }];
+}
+
+async function askClaudeForDeepDiveReflection(
+  env: Env,
+  job: DeepDiveJob,
+  outcome: "done" | "failed",
+  usage: DeepDiveUsage,
+): Promise<DeepDiveReflection> {
+  const prompt = `Rifletti sull'esecuzione di questo job deep-dive. Estrai una procedura SOLO se il job ha rivelato qualcosa che non era già nella skill usata. Estrai una lesson per OGNI errore o retry, anche se poi risolto. Se una skill era iniettata, giudica se ha aiutato (utile), non ha inciso (inutile) o ha portato fuori strada (dannosa). Un job fallito non può generare una skill. Rispondi SOLO con JSON valido:
+{"skill":{"title":"...","content":"markdown max 300 parole"}|null,"lessons":[{"trigger":"quando succede X","rule":"fai o evita Y"}],"skillVerdict":"utile"|"inutile"|"dannosa"|null}
+
+Esito: ${outcome}
+Skill iniettata: ${JSON.stringify(job.learningContext.skill)}
+Lessons iniettate: ${JSON.stringify(job.learningContext.lessons)}
+Esecuzione compatta: ${JSON.stringify({
+  target: job.target,
+  status: job.status,
+  currentStep: job.steps[job.currentStep] ?? null,
+  retryCounts: job.retryCounts,
+  stepExecutions: job.stepExecutions,
+  error: job.error,
+  timing: job.timing,
+})}`;
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({ model: MODEL, max_tokens: 1000, messages: [{ role: "user", content: prompt }] }),
+  });
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`Claude reflection ${response.status}: ${raw}`);
+  const data = JSON.parse(raw) as RawRecord;
+  recordClaudeUsage(usage, data);
+  const text = claudeTextContent(data);
+  const parsed = parseJsonRecord(text);
+  if (!parsed) throw new Error("Riflessione Claude non in JSON valido");
+  const skillRecord = asRecord(parsed.skill);
+  const title = asString(skillRecord.title);
+  const content = asString(skillRecord.content);
+  const rawVerdict = asString(parsed.skillVerdict);
+  const skillVerdict = rawVerdict === "utile" || rawVerdict === "inutile" || rawVerdict === "dannosa" ? rawVerdict : null;
+  const lessons = Array.isArray(parsed.lessons) ? parsed.lessons.filter(isRecord).map((lesson) => ({
+    trigger: asString(lesson.trigger) ?? "",
+    rule: asString(lesson.rule) ?? "",
+  })).filter((lesson) => lesson.trigger && lesson.rule) : [];
+  return {
+    skill: title && content ? { title: title.slice(0, 160), content: limitTextWords(content, 300) } : null,
+    lessons,
+    skillVerdict: job.learningContext.skill ? skillVerdict : null,
+  };
+}
+
+async function createFirestoreLesson(env: Env, lesson: { trigger: string; rule: string }, usage?: DeepDiveUsage): Promise<void> {
+  const embedding = await createGeminiEmbedding(env, `${lesson.trigger}: ${lesson.rule}`, "RETRIEVAL_DOCUMENT", usage);
+  await createFirestoreDocument(env, "lessons", {
+    trigger: lesson.trigger,
+    rule: lesson.rule,
+    embedding,
+    createdAt: new Date().toISOString(),
+  }, usage);
+}
+
+async function createFirestoreSkill(env: Env, skill: { title: string; content: string }, usage?: DeepDiveUsage): Promise<void> {
+  const embedding = await createGeminiEmbedding(env, `${skill.title}\n${skill.content}`, "RETRIEVAL_DOCUMENT", usage);
+  const now = new Date().toISOString();
+  await createFirestoreDocument(env, "skills", {
+    taskType: "deep-dive",
+    title: skill.title,
+    content: skill.content,
+    embedding,
+    usageCount: 0,
+    helpfulCount: 0,
+    harmfulCount: 0,
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+    lastUsedAt: null,
+  }, usage);
+}
+
+async function createFirestoreDocument(env: Env, collection: string, values: Record<string, JsonValue>, usage?: DeepDiveUsage): Promise<void> {
+  if (usage) usage.firestoreWrites += 1;
+  const token = await getFirestoreAccessToken(env);
+  const response = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT_ID}/databases/(default)/documents/${collection}`,
+    {
+      method: "POST",
+      headers: { authorization: "Bearer " + token, "content-type": "application/json" },
+      body: JSON.stringify({ fields: firestoreMap(values) }),
+    },
+  );
+  if (!response.ok) throw new Error(`Firestore ${collection} insert ${response.status}: ${await response.text()}`);
+}
+
+async function applySkillVerdict(env: Env, skillId: string, verdict: NonNullable<DeepDiveReflection["skillVerdict"]>, usage?: DeepDiveUsage): Promise<void> {
+  const document = await getFirestoreDocument(env, `skills/${skillId}`, usage);
+  if (!document) throw new Error(`Skill ${skillId} non trovata`);
+  const fields = asRecord(document.fields);
+  const helpfulCount = asNumber(fromFirestoreValue(fields.helpfulCount)) ?? 0;
+  const harmfulCount = asNumber(fromFirestoreValue(fields.harmfulCount)) ?? 0;
+  const updates: Record<string, JsonValue> = { updatedAt: new Date().toISOString() };
+  if (verdict === "utile") updates.helpfulCount = helpfulCount + 1;
+  if (verdict === "dannosa") updates.harmfulCount = harmfulCount + 1;
+  await patchFirestoreDocument(env, `skills/${skillId}`, updates, usage);
+}
+
+async function reviseFirestoreSkill(
+  env: Env,
+  skillId: string,
+  revision: { title: string; content: string },
+  usage?: DeepDiveUsage,
+): Promise<void> {
+  const document = await getFirestoreDocument(env, `skills/${skillId}`, usage);
+  if (!document) throw new Error(`Skill ${skillId} non trovata`);
+  const fields = asRecord(document.fields);
+  const previousContent = asString(fromFirestoreValue(fields.content)) ?? "";
+  const previousTitle = asString(fromFirestoreValue(fields.title)) ?? "";
+  const version = asNumber(fromFirestoreValue(fields.version)) ?? 1;
+  await createFirestoreDocument(env, `skills/${skillId}/history`, {
+    title: previousTitle,
+    content: previousContent,
+    version,
+    archivedAt: new Date().toISOString(),
+  }, usage);
+  const embedding = await createGeminiEmbedding(env, `${revision.title}\n${revision.content}`, "RETRIEVAL_DOCUMENT", usage);
+  await patchFirestoreDocument(env, `skills/${skillId}`, {
+    title: revision.title,
+    content: revision.content,
+    embedding,
+    version: version + 1,
+    updatedAt: new Date().toISOString(),
+  }, usage);
+}
+
+async function getFirestoreDocument(env: Env, path: string, usage?: DeepDiveUsage): Promise<RawRecord | null> {
+  if (usage) usage.firestoreReads += 1;
+  const token = await getFirestoreAccessToken(env);
+  const response = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT_ID}/databases/(default)/documents/${path}`,
+    { headers: { authorization: "Bearer " + token } },
+  );
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Firestore read ${response.status}: ${await response.text()}`);
+  return asRecord(await response.json());
+}
+
+async function patchFirestoreDocument(env: Env, path: string, values: Record<string, JsonValue>, usage?: DeepDiveUsage): Promise<void> {
+  if (usage) usage.firestoreWrites += 1;
+  const token = await getFirestoreAccessToken(env);
+  const url = new URL(`https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT_ID}/databases/(default)/documents/${path}`);
+  for (const field of Object.keys(values)) url.searchParams.append("updateMask.fieldPaths", field);
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: { authorization: "Bearer " + token, "content-type": "application/json" },
+    body: JSON.stringify({ fields: firestoreMap(values) }),
+  });
+  if (!response.ok) throw new Error(`Firestore update ${response.status}: ${await response.text()}`);
+}
+
+async function deleteFirestoreDocument(env: Env, path: string): Promise<void> {
+  const token = await getFirestoreAccessToken(env);
+  const response = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT_ID}/databases/(default)/documents/${path}`,
+    { method: "DELETE", headers: { authorization: "Bearer " + token } },
+  );
+  if (!response.ok) throw new Error(`Firestore delete ${response.status}: ${await response.text()}`);
+}
+
+async function runWeeklyLearningConsolidation(env: Env): Promise<void> {
+  try {
+    const since = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const [episodeDocuments, skills, lessonDocuments] = await Promise.all([
+      listFirestoreCollection(env, "episodes"),
+      listLearningSkills(env),
+      listFirestoreCollection(env, "lessons"),
+    ]);
+    const episodes = episodeDocuments
+      .map(toWeeklyEpisode)
+      .filter((episode): episode is WeeklyEpisode => episode !== null && episode.createdAt >= since);
+    const lessons = lessonDocuments
+      .map(toWeeklyLesson)
+      .filter((lesson): lesson is WeeklyLesson => lesson !== null && lesson.createdAt >= since);
+    const statistics = summarizeWeeklyEpisodes(episodes);
+    const contextEpisodes = selectWeeklyEpisodeContext(episodes, statistics.averageDurationMs);
+    const result = await askClaudeForWeeklyLearningConsolidation(env, statistics, skills, lessons, contextEpisodes);
+
+    await sendMessage(env, OWNER_CHAT_ID, `🧠 Stato apprendimento settimanale\n\n${result.summary}`);
+    const { notes } = await listArretratiNotes(env);
+    const active = notes.filter((note) => !hasTag(note.text, "#sospeso") && !hasTag(note.text, "#daregolarizzare") && parseLatestHistory(note.text)?.event !== "consegnato");
+    const inflated = active.filter((note) => hasTag(note.text, "#importante") || hasTag(note.text, "#obbligatorio")).length;
+    if (active.length && inflated / active.length > 0.3) await sendMessage(env, OWNER_CHAT_ID, `⚠️ Drift tag: ${inflated}/${active.length} schede attive (${Math.round(inflated / active.length * 100)}%) sono #importante o #obbligatorio.`);
+    for (const proposal of result.proposals.merges) {
+      const pending = await createPendingAction(env, OWNER_CHAT_ID, "skill-merge", proposal);
+      await sendMessage(
+        env,
+        OWNER_CHAT_ID,
+        `Proposta: unire ${proposal.lessonIds.length} lessons in una regola.\nQuando ${proposal.trigger}: ${proposal.rule}`,
+        { inlineKeyboard: [[{ text: "✅ Approva", callback_data: pending.approveData }, { text: "❌ Rifiuta", callback_data: pending.rejectData }]] },
+      );
+    }
+    for (const proposal of result.proposals.quarantines) {
+      const pending = await createPendingAction(env, OWNER_CHAT_ID, "skill-quarantine", proposal);
+      await sendMessage(
+        env,
+        OWNER_CHAT_ID,
+        `Proposta: quarantena skill ${proposal.skillId}.\nMotivo: ${proposal.reason}`,
+        { inlineKeyboard: [[{ text: "✅ Approva", callback_data: pending.approveData }, { text: "❌ Rifiuta", callback_data: pending.rejectData }]] },
+      );
+    }
+    console.log(`[FASE-3] Consolidamento completato: episodi=${episodes.length}, merge=${result.proposals.merges.length}, quarantene=${result.proposals.quarantines.length}.`);
+  } catch (error) {
+    console.error("[FASE-3] Consolidamento settimanale fallito:", error);
+  }
+}
+
+type WeeklyEpisode = {
+  jobId: string;
+  outcome: "done" | "failed";
+  createdAt: number;
+  durationMs: number;
+  failedStep: string | null;
+  skillUsed: string | null;
+};
+type WeeklyLesson = { id: string; trigger: string; rule: string; createdAt: number };
+type WeeklyStatistics = { total: number; failed: number; fragileStep: string | null; averageDurationMs: number };
+
+function toWeeklyEpisode(document: RawRecord): WeeklyEpisode | null {
+  const fields = asRecord(document.fields);
+  const outcome = asString(fromFirestoreValue(fields.outcome));
+  const createdAt = Date.parse(asString(fromFirestoreValue(fields.createdAt)) ?? "");
+  if ((outcome !== "done" && outcome !== "failed") || !Number.isFinite(createdAt)) return null;
+  const steps = fromFirestoreValue(fields.steps);
+  const durationMs = Array.isArray(steps) ? steps.filter(isRecord).reduce((sum, step) => sum + (asNumber(step.durationMs) ?? 0), 0) : 0;
+  return {
+    jobId: asString(fromFirestoreValue(fields.jobId)) ?? firestoreDocumentId(asString(document.name) ?? ""),
+    outcome,
+    createdAt,
+    durationMs,
+    failedStep: asString(fromFirestoreValue(fields.failedStep)),
+    skillUsed: asString(fromFirestoreValue(fields.skillUsed)),
+  };
+}
+
+function toWeeklyLesson(document: RawRecord): WeeklyLesson | null {
+  const fields = asRecord(document.fields);
+  const createdAt = Date.parse(asString(fromFirestoreValue(fields.createdAt)) ?? "");
+  const trigger = asString(fromFirestoreValue(fields.trigger));
+  const rule = asString(fromFirestoreValue(fields.rule));
+  const id = firestoreDocumentId(asString(document.name) ?? "");
+  return Number.isFinite(createdAt) && id && trigger && rule ? { id, trigger, rule, createdAt } : null;
+}
+
+function summarizeWeeklyEpisodes(episodes: WeeklyEpisode[]): WeeklyStatistics {
+  const stepFailures = new Map<string, number>();
+  for (const episode of episodes) if (episode.failedStep) stepFailures.set(episode.failedStep, (stepFailures.get(episode.failedStep) ?? 0) + 1);
+  const fragileStep = [...stepFailures.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? null;
+  return {
+    total: episodes.length,
+    failed: episodes.filter((episode) => episode.outcome === "failed").length,
+    fragileStep,
+    averageDurationMs: episodes.length ? Math.round(episodes.reduce((sum, episode) => sum + episode.durationMs, 0) / episodes.length) : 0,
+  };
+}
+
+function selectWeeklyEpisodeContext(episodes: WeeklyEpisode[], averageDurationMs: number): WeeklyEpisode[] {
+  const exceptional = episodes.filter((episode) => episode.outcome === "failed" || Boolean(episode.skillUsed)
+    || (averageDurationMs > 0 && episode.durationMs > averageDurationMs * 2));
+  return exceptional.sort((left, right) => right.durationMs - left.durationMs).slice(0, 10);
+}
+
+async function askClaudeForWeeklyLearningConsolidation(
+  env: Env,
+  statistics: WeeklyStatistics,
+  skills: LearningSkill[],
+  lessons: WeeklyLesson[],
+  episodes: WeeklyEpisode[],
+): Promise<{ summary: string; proposals: WeeklyLearningProposal }> {
+  const prompt = `Consolida la memoria di un agente. In base a statistiche, skills, lessons e casi eccezionali: proponi solo merge di lessons chiaramente duplicate/sovrapposte e quarantene di skill con uso alto ma pochi giudizi utili. Non applicare modifiche. Produci 3-5 righe di stato apprendimento. Rispondi SOLO JSON valido:
+{"summary":"...","merges":[{"lessonIds":["id"],"trigger":"...","rule":"..."}],"quarantines":[{"skillId":"...","reason":"..."}]}
+
+Statistiche: ${JSON.stringify(statistics)}
+Skills: ${JSON.stringify(skills.map((skill) => ({ id: skill.id, title: skill.title, usageCount: skill.usageCount, helpfulCount: skill.helpfulCount, harmfulCount: skill.harmfulCount })))}
+Lessons della settimana: ${JSON.stringify(lessons)}
+Casi da esaminare: ${JSON.stringify(episodes)}`;
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({ model: MODEL, max_tokens: 900, messages: [{ role: "user", content: prompt }] }),
+  });
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`Claude weekly consolidation ${response.status}: ${raw}`);
+  const data = JSON.parse(raw) as { content?: Array<{ type?: string; text?: string }> };
+  const text = (data.content ?? []).filter((block) => block.type === "text").map((block) => block.text ?? "").join("\n");
+  const parsed = parseJsonRecord(text);
+  if (!parsed) throw new Error("Consolidamento Claude non in JSON valido");
+  const merges = Array.isArray(parsed.merges) ? parsed.merges.filter(isRecord).map((merge) => ({
+    lessonIds: Array.isArray(merge.lessonIds) ? merge.lessonIds.filter((id): id is string => typeof id === "string") : [],
+    trigger: asString(merge.trigger) ?? "",
+    rule: asString(merge.rule) ?? "",
+  })).filter((merge) => merge.lessonIds.length >= 2 && merge.trigger && merge.rule) : [];
+  const quarantines = Array.isArray(parsed.quarantines) ? parsed.quarantines.filter(isRecord).map((quarantine) => ({
+    skillId: asString(quarantine.skillId) ?? "",
+    reason: asString(quarantine.reason) ?? "",
+  })).filter((quarantine) => quarantine.skillId && quarantine.reason) : [];
+  return {
+    summary: limitTextWords(asString(parsed.summary) ?? "Nessun dato di apprendimento disponibile questa settimana.", 120),
+    proposals: { merges, quarantines },
+  };
+}
+
+async function listLearningSkills(env: Env, usage?: DeepDiveUsage): Promise<LearningSkill[]> {
+  const documents = await listFirestoreCollection(env, "skills", usage);
+  return documents.map((document) => {
+    const fields = asRecord(document.fields);
+    return {
+      id: firestoreDocumentId(asString(document.name) ?? ""),
+      title: asString(fromFirestoreValue(fields.title)) ?? "skill senza titolo",
+      content: asString(fromFirestoreValue(fields.content)) ?? "",
+      embedding: asNumberArray(fromFirestoreValue(fields.embedding)),
+      helpfulCount: asNumber(fromFirestoreValue(fields.helpfulCount)) ?? 0,
+      harmfulCount: asNumber(fromFirestoreValue(fields.harmfulCount)) ?? 0,
+      usageCount: asNumber(fromFirestoreValue(fields.usageCount)) ?? 0,
+    };
+  }).filter((skill) => Boolean(skill.id) && Boolean(skill.content) && skill.embedding.length === GEMINI_EMBEDDING_DIMENSIONS);
+}
+
+async function listLearningLessons(env: Env, usage?: DeepDiveUsage): Promise<LearningLesson[]> {
+  const documents = await listFirestoreCollection(env, "lessons", usage);
+  return documents.map((document) => {
+    const fields = asRecord(document.fields);
+    return {
+      id: firestoreDocumentId(asString(document.name) ?? ""),
+      trigger: asString(fromFirestoreValue(fields.trigger)) ?? "",
+      rule: asString(fromFirestoreValue(fields.rule)) ?? "",
+      embedding: asNumberArray(fromFirestoreValue(fields.embedding)),
+    };
+  }).filter((lesson) => Boolean(lesson.id) && Boolean(lesson.trigger) && Boolean(lesson.rule)
+    && lesson.embedding.length === GEMINI_EMBEDDING_DIMENSIONS);
+}
+
+async function listFirestoreCollection(env: Env, collectionId: string, usage?: DeepDiveUsage): Promise<RawRecord[]> {
+  if (usage) usage.firestoreReads += 1;
+  const token = await getFirestoreAccessToken(env);
+  const response = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT_ID}/databases/(default)/documents:runQuery`,
+    {
+      method: "POST",
+      headers: { authorization: "Bearer " + token, "content-type": "application/json" },
+      body: JSON.stringify({ structuredQuery: { from: [{ collectionId }], limit: 200 } }),
+    },
+  );
+  if (!response.ok) throw new Error(`Firestore ${collectionId} query ${response.status}: ${await response.text()}`);
+  const rows: unknown = await response.json();
+  return Array.isArray(rows) ? rows.map((row) => asRecord(asRecord(row).document)).filter((document) => Object.keys(document).length) : [];
+}
+
+async function incrementSkillUsage(env: Env, skill: LearningSkill, usage?: DeepDiveUsage): Promise<void> {
+  if (usage) usage.firestoreWrites += 1;
+  const token = await getFirestoreAccessToken(env);
+  const url = new URL(`https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT_ID}/databases/(default)/documents/skills/${skill.id}`);
+  url.searchParams.append("updateMask.fieldPaths", "usageCount");
+  url.searchParams.append("updateMask.fieldPaths", "lastUsedAt");
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: { authorization: "Bearer " + token, "content-type": "application/json" },
+    body: JSON.stringify({ fields: {
+      usageCount: { integerValue: String(skill.usageCount + 1) },
+      lastUsedAt: { timestampValue: new Date().toISOString() },
+    } }),
+  });
+  if (!response.ok) throw new Error(`Firestore skill usage ${response.status}: ${await response.text()}`);
+}
+
+function firestoreDocumentId(name: string): string {
+  return name.split("/").pop() ?? "";
+}
+
+function asNumberArray(value: unknown): number[] {
+  return Array.isArray(value) ? value.filter((item): item is number => typeof item === "number" && Number.isFinite(item)) : [];
+}
+
+function normalizeEmbedding(values: number[]): number[] {
+  const magnitude = Math.sqrt(values.reduce((sum, value) => sum + value * value, 0));
+  if (!magnitude) throw new Error("Embedding nullo");
+  return values.map((value) => value / magnitude);
+}
+
+function cosineSimilarity(left: number[], right: number[]): number {
+  if (left.length !== right.length || !left.length) return -1;
+  return left.reduce((sum, value, index) => sum + value * right[index], 0);
+}
+
+async function resolveDeepDiveTarget(
+  env: Env,
+  target: string,
+  learningContext: DeepDiveLearningContext,
+  usage: DeepDiveUsage,
+): Promise<DeepDiveStepResult> {
   const cleaned = target.trim();
   const completedAt = new Date().toISOString();
   const withoutAt = cleaned.replace(/^@/, "");
@@ -440,7 +1315,7 @@ async function resolveDeepDiveTarget(env: Env, target: string): Promise<DeepDive
   if (!looksLikeWebsite && cleaned.startsWith("@")) {
     const igHandle = cleaned.slice(1).replace(/[^a-z0-9._]/gi, "");
     if (!igHandle) throw new Error("handle Instagram non valido");
-    const identity = await identifyInstagramTarget(env, igHandle);
+    const identity = await identifyInstagramTarget(env, igHandle, learningContext, usage);
     return {
       ok: true,
       step: "resolve",
@@ -451,11 +1326,13 @@ async function resolveDeepDiveTarget(env: Env, target: string): Promise<DeepDive
     };
   }
 
+  if (!looksLikeWebsite) return resolveNamedDeepDiveTarget(env, cleaned, completedAt, learningContext, usage);
+
   try {
     const websiteInput = withoutAt.match(/^https?:\/\//i) ? withoutAt : `https://${withoutAt}`;
     const websiteUrl = new URL(websiteInput).toString();
     const fallbackName = new URL(websiteUrl).hostname.replace(/^www\./i, "");
-    const identity = await identifyWebsiteTarget(env, websiteUrl, fallbackName);
+    const identity = await identifyWebsiteTarget(env, websiteUrl, fallbackName, learningContext, usage);
     return {
       ok: true,
       step: "resolve",
@@ -469,11 +1346,51 @@ async function resolveDeepDiveTarget(env: Env, target: string): Promise<DeepDive
   }
 }
 
-async function identifyInstagramTarget(env: Env, igHandle: string): Promise<{ displayName: string; websiteUrl: string | null }> {
+async function resolveNamedDeepDiveTarget(
+  env: Env,
+  target: string,
+  completedAt: string,
+  learningContext: DeepDiveLearningContext,
+  usage: DeepDiveUsage,
+): Promise<DeepDiveStepResult> {
+  const raw = await askClaudeWithWebSearch(
+    env,
+    `Cerca sul web "${target}" fotografo instagram sito. Rispondi SOLO con JSON valido: {"displayName":"nome pubblico esatto oppure null","igHandle":"handle Instagram senza @ oppure null","websiteUrl":"URL del sito ufficiale oppure null"}. Accetta solo elementi chiaramente associati alla stessa attivita e non inventare dati.\n\n${formatDeepDiveLearningContext(learningContext)}`,
+    usage,
+    1,
+    450,
+  );
+  const identity = parseJsonRecord(raw);
+  const displayName = asString(identity?.displayName);
+  const rawHandle = asString(identity?.igHandle);
+  const igHandle = rawHandle ? rawHandle.replace(/^@/, "").replace(/[^a-z0-9._]/gi, "") || null : null;
+  const websiteUrl = normalizeWebsiteUrl(asString(identity?.websiteUrl));
+  if (!displayName || (!igHandle && !websiteUrl)) {
+    throw new Error("non ho trovato un profilo Instagram o un sito attendibile per questo nome");
+  }
+  return {
+    ok: true,
+    step: "resolve",
+    completedAt,
+    displayName,
+    ...(igHandle ? { igHandle } : {}),
+    ...(websiteUrl ? { websiteUrl } : {}),
+  };
+}
+
+async function identifyInstagramTarget(
+  env: Env,
+  igHandle: string,
+  learningContext: DeepDiveLearningContext,
+  usage: DeepDiveUsage,
+): Promise<{ displayName: string; websiteUrl: string | null }> {
   try {
     const raw = await askClaudeWithWebSearch(
       env,
-      `Cerca sul web il fotografo o brand associato al profilo Instagram @${igHandle}. Rispondi SOLO con JSON valido: {"displayName":"nome pubblico esatto","websiteUrl":"URL del sito ufficiale oppure null"}. Considera ufficiale solo un sito chiaramente associato allo stesso brand. Non inventare dati.`,
+      `Cerca sul web il fotografo o brand associato al profilo Instagram @${igHandle}. Rispondi SOLO con JSON valido: {"displayName":"nome pubblico esatto","websiteUrl":"URL del sito ufficiale oppure null"}. Considera ufficiale solo un sito chiaramente associato allo stesso brand. Non inventare dati.\n\n${formatDeepDiveLearningContext(learningContext)}`,
+      usage,
+      1,
+      450,
     );
     const identity = parseJsonRecord(raw);
     const displayName = asString(identity?.displayName) ?? igHandle;
@@ -496,11 +1413,20 @@ function normalizeWebsiteUrl(value: string | null): string | null {
   }
 }
 
-async function identifyWebsiteTarget(env: Env, websiteUrl: string, fallbackName: string): Promise<{ displayName: string; igHandle: string | null }> {
+async function identifyWebsiteTarget(
+  env: Env,
+  websiteUrl: string,
+  fallbackName: string,
+  learningContext: DeepDiveLearningContext,
+  usage: DeepDiveUsage,
+): Promise<{ displayName: string; igHandle: string | null }> {
   try {
     const raw = await askClaudeWithWebSearch(
       env,
-      `Cerca sul web il brand o fotografo associato a questo sito: ${websiteUrl}. Rispondi SOLO con JSON valido: {"displayName":"nome pubblico esatto","igHandle":"handle Instagram senza @ oppure null"}. Non inventare dati: se un campo non emerge, usa null.`,
+      `Cerca sul web il brand o fotografo associato a questo sito: ${websiteUrl}. Rispondi SOLO con JSON valido: {"displayName":"nome pubblico esatto","igHandle":"handle Instagram senza @ oppure null"}. Non inventare dati: se un campo non emerge, usa null.\n\n${formatDeepDiveLearningContext(learningContext)}`,
+      usage,
+      1,
+      450,
     );
     const identity = parseJsonRecord(raw);
     const displayName = asString(identity?.displayName) ?? fallbackName;
@@ -522,7 +1448,7 @@ async function runInstagramDeepDive(env: Env, job: DeepDiveJob): Promise<DeepDiv
   }
   if (!env.APIFY_TOKEN) throw new Error("secret APIFY_TOKEN mancante su saverio-bot");
 
-  const rawPosts = await fetchInstagramPostsForDeepDive(env, igHandle);
+  const rawPosts = await fetchInstagramPostsForDeepDive(env, igHandle, job.usage);
   const posts = rawPosts.slice(0, DEEP_DIVE_POST_LIMIT).map(toDeepDiveInstagramPost);
   const profile = extractInstagramProfile(rawPosts[0]);
   const metrics = calculateInstagramMetrics(posts, profile.followers);
@@ -538,7 +1464,9 @@ async function runInstagramDeepDive(env: Env, job: DeepDiveJob): Promise<DeepDiv
   };
 }
 
-async function fetchInstagramPostsForDeepDive(env: Env, username: string): Promise<RawRecord[]> {
+async function fetchInstagramPostsForDeepDive(env: Env, username: string, usage: DeepDiveUsage): Promise<RawRecord[]> {
+  usage.apifyRuns += 1;
+  usage.apifyHttpRequests += 1;
   const runRes = await fetch(
     `https://api.apify.com/v2/acts/${APIFY_INSTAGRAM_POST_ACTOR}/runs?token=${env.APIFY_TOKEN}`,
     {
@@ -554,6 +1482,7 @@ async function fetchInstagramPostsForDeepDive(env: Env, username: string): Promi
 
   for (let attempt = 0; attempt < 12; attempt += 1) {
     await new Promise<void>((resolve) => setTimeout(resolve, 5000));
+    usage.apifyHttpRequests += 1;
     const statusRes = await fetch(`https://api.apify.com/v2/actor-runs/${runId}?token=${env.APIFY_TOKEN}`);
     if (!statusRes.ok) throw new Error(`Apify status error: ${statusRes.status}`);
     const status = asString(asRecord(asRecord(await statusRes.json()).data).status);
@@ -562,6 +1491,7 @@ async function fetchInstagramPostsForDeepDive(env: Env, username: string): Promi
     if (attempt === 11) throw new Error("Apify run timeout");
   }
 
+  usage.apifyHttpRequests += 1;
   const dataRes = await fetch(`https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${env.APIFY_TOKEN}`);
   if (!dataRes.ok) throw new Error(`Apify dataset error: ${dataRes.status}`);
   const data: unknown = await dataRes.json();
@@ -661,7 +1591,7 @@ async function runWebsiteDeepDive(job: DeepDiveJob): Promise<DeepDiveStepResult>
     return { ok: true, step: "website", completedAt, skipped: true, note: "Nessun URL sito disponibile." };
   }
 
-  const home = await fetchWebsitePage(websiteUrl);
+  const home = await fetchWebsitePage(websiteUrl, job.usage);
   if (!home) {
     return {
       ok: true,
@@ -673,17 +1603,24 @@ async function runWebsiteDeepDive(job: DeepDiveJob): Promise<DeepDiveStepResult>
   }
 
   const links = extractRelevantWebsiteLinks(home.html, home.url);
-  const pages: WebsitePage[] = [{ url: home.url, title: extractHtmlTitle(home.html), textContent: htmlToText(home.html) }];
+  let remainingTextBudget = DEEP_DIVE_WEBSITE_TOTAL_TEXT_LIMIT;
+  const toWebsitePage = (page: { url: string; html: string }): WebsitePage => {
+    const textContent = htmlToText(page.html).slice(0, Math.max(0, Math.min(DEEP_DIVE_WEBSITE_PAGE_TEXT_LIMIT, remainingTextBudget)));
+    remainingTextBudget -= textContent.length;
+    return { url: page.url, title: extractHtmlTitle(page.html), textContent };
+  };
+  const pages: WebsitePage[] = [toWebsitePage(home)];
   for (const link of links.slice(0, 5)) {
-    const page = await fetchWebsitePage(link);
+    const page = await fetchWebsitePage(link, job.usage);
     if (!page) continue;
-    pages.push({ url: page.url, title: extractHtmlTitle(page.html), textContent: htmlToText(page.html) });
+    pages.push(toWebsitePage(page));
   }
 
   return { ok: true, step: "website", completedAt, websiteUrl, pages };
 }
 
-async function fetchWebsitePage(url: string): Promise<{ url: string; html: string } | null> {
+async function fetchWebsitePage(url: string, usage?: DeepDiveUsage): Promise<{ url: string; html: string } | null> {
+  if (usage) usage.websiteFetches += 1;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10_000);
   try {
@@ -696,7 +1633,9 @@ async function fetchWebsitePage(url: string): Promise<{ url: string; html: strin
       signal: controller.signal,
       redirect: "follow",
     });
-    if (!response.ok || !response.headers.get("content-type")?.includes("text/html")) return null;
+    const contentLength = Number(response.headers.get("content-length") ?? "0");
+    if (!response.ok || !response.headers.get("content-type")?.includes("text/html")
+      || (Number.isFinite(contentLength) && contentLength > 750_000)) return null;
     const html = await response.text();
     return html ? { url: response.url, html } : null;
   } catch (error) {
@@ -751,6 +1690,247 @@ function htmlToText(html: string): string {
     .slice(0, 8000);
 }
 
+// ===== Fase 6: link inbox =====
+
+type SavedRead = { id: string; title: string; url: string; summary: string; embedding: number[] };
+type ReadCrossReference = { kind: "skill" | "read"; title: string; score: number };
+
+function extractSharedLink(text: string): string | null {
+  const raw = text.match(/https?:\/\/[^\s<>]+/i)?.[0]?.replace(/[),.;!?]+$/, "");
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    const host = url.hostname.toLowerCase();
+    const privateHost = host === "localhost" || host.endsWith(".localhost") || host === "::1"
+      || /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host)
+      || /^172\.(1[6-9]|2\d|3[01])\./.test(host) || /^0\./.test(host);
+    if (!/^https?:$/.test(url.protocol) || privateHost) return null;
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function gestisciLinkInbox(env: Env, text: string): Promise<string | null> {
+  const url = extractSharedLink(text);
+  if (!url) return null;
+
+  let stage: "lettura" | "sintesi" | "embedding" | "collegamenti" | "salvataggio" = "lettura";
+  try {
+    const page = await fetchReadableLink(url);
+    const resolvedUrl = page?.url ?? url;
+    stage = "sintesi";
+    const read = page && page.textContent.length >= 100
+      ? await summarizeRead(env, page.url, page.title || new URL(page.url).hostname, page.textContent)
+      : await summarizeReadFromWeb(env, url);
+    stage = "embedding";
+    const embedding = await createGeminiEmbedding(env, `${read.title}\n${read.summary}`, "RETRIEVAL_DOCUMENT");
+    stage = "collegamenti";
+    const [skills, savedReads] = await Promise.all([listLearningSkills(env), listSavedReads(env)]);
+    const related = findReadCrossReferences(embedding, skills, savedReads);
+
+    stage = "salvataggio";
+    await createFirestoreDocument(env, "reads", {
+      url: resolvedUrl,
+      title: read.title,
+      summary: read.summary,
+      keywords: read.keywords,
+      embedding,
+      createdAt: new Date().toISOString(),
+    });
+
+    const connections = related.length
+      ? `\n\nSembra collegato a: ${related.map((item) => `[${item.kind === "skill" ? "skill" : "lettura"}: ${item.title}]`).join(", ")}.`
+      : "";
+    return `Salvato: ${read.title}\n\n${read.summary}${connections}`;
+  } catch (error) {
+    console.error(`[FASE-6] Link inbox fallito in ${stage}:`, error);
+    const labels = {
+      lettura: "lettura della pagina",
+      sintesi: "creazione del riassunto",
+      embedding: "creazione dell'embedding Gemini",
+      collegamenti: "ricerca dei collegamenti in Firestore",
+      salvataggio: "salvataggio nella collection reads",
+    } as const;
+    return `Non sono riuscito a salvare questo link: errore durante ${labels[stage]}.`;
+  }
+}
+
+async function fetchReadableLink(url: string): Promise<{ url: string; title: string | null; textContent: string } | null> {
+  const direct = await fetchWebsitePage(url);
+  if (direct) {
+    return {
+      url: direct.url,
+      title: extractHtmlTitle(direct.html),
+      textContent: htmlToText(direct.html),
+    };
+  }
+
+  // Alcuni siti pubblici bloccano i fetch dei Worker: il reader restituisce solo testo/Markdown.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(`https://r.jina.ai/${url}`, {
+      headers: { accept: "text/plain", "x-return-format": "markdown" },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      console.error(`[FASE-6] Reader HTTP ${response.status} per ${url}`);
+      return null;
+    }
+    const markdown = (await response.text()).replace(/\s+/g, " ").trim();
+    if (!markdown) return null;
+    const readerTitle = markdown.match(/^Title:\s*(.+?)(?:\s+URL:|$)/i)?.[1]?.trim() ?? null;
+    return { url, title: readerTitle, textContent: markdown.slice(0, 8000) };
+  } catch (error) {
+    console.error("[FASE-6] Fallback reader fallito:", url, error);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function summarizeReadFromWeb(
+  env: Env,
+  url: string,
+): Promise<{ title: string; summary: string; keywords: string[] }> {
+  const raw = await askClaudeWithWebSearch(
+    env,
+    `Consulta questa pagina pubblica: ${url}\nProduci una scheda fedele al contenuto della pagina, non una descrizione generica del sito. Riassunto in italiano massimo 200 parole e 3-5 keyword specifiche. Se la pagina non è realmente accessibile, restituisci summary vuoto. Rispondi SOLO JSON valido:\n{"title":"titolo breve","summary":"riassunto max 200 parole","keywords":["keyword"]}`,
+  );
+  return parseReadSummary(raw, new URL(url).hostname);
+}
+
+async function summarizeRead(
+  env: Env,
+  url: string,
+  title: string,
+  content: string,
+): Promise<{ title: string; summary: string; keywords: string[] }> {
+  const prompt = `Sei l'archivista di Saverio. Riassumi questa pagina in italiano in massimo 200 parole. Estrai 3-5 keyword specifiche. Non inventare informazioni e non dare istruzioni operative. Rispondi SOLO JSON valido:
+{"title":"titolo breve","summary":"riassunto max 200 parole","keywords":["keyword"]}
+
+URL: ${url}
+Titolo pagina: ${title}
+Testo estratto:\n${content.slice(0, 8000)}`;
+  const raw = await askClaudeJSON(env, prompt, "Crea la scheda di lettura.");
+  return parseReadSummary(raw, title);
+}
+
+function parseReadSummary(
+  raw: string,
+  fallbackTitle: string,
+): { title: string; summary: string; keywords: string[] } {
+  const parsed = parseJsonRecord(raw);
+  const summary = limitWords(asString(parsed?.summary) ?? "", 200);
+  const keywords = Array.isArray(parsed?.keywords)
+    ? parsed!.keywords.filter((keyword): keyword is string => typeof keyword === "string" && keyword.trim().length > 1).map((keyword) => keyword.trim()).slice(0, 5)
+    : [];
+  if (!summary) throw new Error("Claude non ha prodotto un riassunto del link");
+  return {
+    title: (asString(parsed?.title) ?? fallbackTitle).replace(/\s+/g, " ").trim().slice(0, 200),
+    summary,
+    keywords: keywords.length >= 3 ? keywords : ["lettura", "link", "da classificare"],
+  };
+}
+
+function limitWords(text: string, limit: number): string {
+  return text.replace(/\s+/g, " ").trim().split(" ").filter(Boolean).slice(0, limit).join(" ");
+}
+
+async function listSavedReads(env: Env): Promise<SavedRead[]> {
+  const documents = await listFirestoreCollection(env, "reads");
+  return documents.map((document) => {
+    const fields = asRecord(document.fields);
+    return {
+      id: firestoreDocumentId(asString(document.name) ?? ""),
+      title: asString(fromFirestoreValue(fields.title)) ?? "lettura senza titolo",
+      url: asString(fromFirestoreValue(fields.url)) ?? "",
+      summary: asString(fromFirestoreValue(fields.summary)) ?? "",
+      embedding: asNumberArray(fromFirestoreValue(fields.embedding)),
+    };
+  }).filter((read) => Boolean(read.id) && Boolean(read.url) && Boolean(read.summary)
+    && read.embedding.length === GEMINI_EMBEDDING_DIMENSIONS);
+}
+
+async function loadRelevantReads(env: Env, text: string): Promise<SavedRead[]> {
+  if (!env.GEMINI_API_KEY) return [];
+  try {
+    const reads = await listSavedReads(env);
+    if (!reads.length) return [];
+    const embedding = await createGeminiEmbedding(env, text, "RETRIEVAL_QUERY");
+    return reads
+      .map((read) => ({ read, score: cosineSimilarity(embedding, read.embedding) }))
+      .filter(({ score }) => score > 0.80)
+      .sort((left, right) => right.score - left.score)
+      .slice(0, 3)
+      .map(({ read }) => read);
+  } catch (error) {
+    console.error("[FASE-6] Retrieval link fallito:", error);
+    return [];
+  }
+}
+
+function isReadsSearchIntent(text: string): boolean {
+  const value = normalizeForMatch(text);
+  return /cosa (?:abbiamo|hai|ho) salvat/.test(value)
+    || /(?:cerca|trova).*(?:letture|link salvat|archivio)/.test(value)
+    || /(?:letture|link salvat).*(?:su|riguardo|parlano)/.test(value);
+}
+
+async function gestisciReadsSearch(env: Env, text: string): Promise<string | null> {
+  if (!isReadsSearchIntent(text)) return null;
+  try {
+    const reads = await listSavedReads(env);
+    if (!reads.length) return "Non ci sono ancora link salvati nella Link inbox.";
+
+    const queryWords = keywordSet(text);
+    let queryEmbedding: number[] | null = null;
+    if (env.GEMINI_API_KEY) {
+      try {
+        queryEmbedding = await createGeminiEmbedding(env, text, "RETRIEVAL_QUERY");
+      } catch (error) {
+        console.error("[FASE-6] Embedding ricerca letture fallito:", error);
+      }
+    }
+
+    const matches = reads.map((read) => {
+      const readWords = keywordSet(`${read.title} ${read.summary}`);
+      let lexicalMatches = 0;
+      for (const word of queryWords) if (readWords.has(word)) lexicalMatches += 1;
+      const semanticScore = queryEmbedding ? cosineSimilarity(queryEmbedding, read.embedding) : -1;
+      return { read, lexicalMatches, semanticScore, rank: semanticScore + Math.min(0.3, lexicalMatches * 0.1) };
+    }).filter(({ lexicalMatches, semanticScore }) => lexicalMatches > 0 || semanticScore > 0.70)
+      .sort((left, right) => right.rank - left.rank)
+      .slice(0, 3);
+
+    if (!matches.length) return "Non ho trovato letture salvate pertinenti a questa ricerca.";
+    return matches.map(({ read }, index) => [
+      `${index + 1}. ${read.title}`,
+      read.summary,
+      read.url,
+    ].join("\n")).join("\n\n");
+  } catch (error) {
+    console.error("[FASE-6] Ricerca letture fallita:", error);
+    return "Non riesco a consultare le letture salvate in questo momento.";
+  }
+}
+
+function findReadCrossReferences(
+  embedding: number[],
+  skills: LearningSkill[],
+  reads: SavedRead[],
+): ReadCrossReference[] {
+  const candidates: ReadCrossReference[] = [
+    ...skills.map((skill) => ({ kind: "skill" as const, title: skill.title, score: cosineSimilarity(embedding, skill.embedding) })),
+    ...reads.map((read) => ({ kind: "read" as const, title: read.title, score: cosineSimilarity(embedding, read.embedding) })),
+  ];
+  return candidates.filter((candidate) => candidate.score > 0.80)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 3);
+}
+
 async function runWebMentionsDeepDive(env: Env, job: DeepDiveJob): Promise<DeepDiveStepResult> {
   const displayName = job.results.resolve ? asString(job.results.resolve.displayName) : null;
   if (!displayName) throw new Error("nome concorrente non disponibile per la ricerca web");
@@ -760,13 +1940,19 @@ async function runWebMentionsDeepDive(env: Env, job: DeepDiveJob): Promise<DeepD
     `"${displayName}" matrimonio.com OR zankyou`,
     `"${displayName}" premio OR award fotografo`,
   ];
-  const prompt = `Cerca sul web queste tre query, una alla volta:\n${queries.map((query) => `- ${query}`).join("\n")}\n\nRispondi SOLO con JSON valido nel formato {"mentions":[{"query":"...","title":"...","snippet":"...","url":"..."}]}. Raccogli al massimo 6 risultati in totale. Usa solo risultati realmente trovati, senza inventare URL o testi.`;
-  const raw = await askClaudeWithWebSearch(env, prompt);
+  const prompt = `Cerca sul web queste tre query, una alla volta:\n${queries.map((query) => `- ${query}`).join("\n")}\n\nRispondi SOLO con JSON valido nel formato {"mentions":[{"query":"...","title":"...","snippet":"...","url":"..."}]}. Raccogli al massimo 6 risultati in totale. Usa solo risultati realmente trovati, senza inventare URL o testi.\n\n${formatDeepDiveLearningContext(job.learningContext)}`;
+  const raw = await askClaudeWithWebSearch(env, prompt, job.usage, 3, 900);
   const mentions = parseWebMentions(raw);
   return { ok: true, step: "web-mentions", completedAt: new Date().toISOString(), queries, mentions };
 }
 
-async function askClaudeWithWebSearch(env: Env, prompt: string): Promise<string> {
+async function askClaudeWithWebSearch(
+  env: Env,
+  prompt: string,
+  usage?: DeepDiveUsage,
+  maxUses = 3,
+  maxTokens = 900,
+): Promise<string> {
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -776,19 +1962,16 @@ async function askClaudeWithWebSearch(env: Env, prompt: string): Promise<string>
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 1400,
+      max_tokens: maxTokens,
       messages: [{ role: "user", content: prompt }],
-      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }],
+      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: maxUses }],
     }),
   });
   const raw = await response.text();
   if (!response.ok) throw new Error(`Claude web search error: ${response.status} ${raw}`);
-  const data = JSON.parse(raw) as { content?: Array<{ type?: string; text?: string }> };
-  return (data.content ?? [])
-    .filter((block) => block.type === "text")
-    .map((block) => block.text ?? "")
-    .join("\n")
-    .trim();
+  const data = JSON.parse(raw) as RawRecord;
+  recordClaudeUsage(usage, data);
+  return claudeTextContent(data);
 }
 
 function parseWebMentions(raw: string): Array<{ query: string; title: string; snippet: string; url: string }> {
@@ -826,16 +2009,125 @@ function parseJsonRecord(raw: string): RawRecord | null {
   return null;
 }
 
-async function runDeepDivePlaceholderStep(step: DeepDiveStep): Promise<DeepDiveStepResult> {
-  await new Promise<void>((resolve) => setTimeout(resolve, 1000));
-  return { ok: true, step, completedAt: new Date().toISOString() };
+async function runSynthesizeDeepDive(env: Env, job: DeepDiveJob): Promise<DeepDiveStepResult> {
+  const raw = await askClaudeForDeepDiveReport(env, job.results, job.learningContext, job.usage);
+  const report = limitDeepDiveReport(formatDeepDiveReportForTelegram(raw));
+  if (!report) throw new Error("Claude non ha prodotto il report dell'indagine");
+  return {
+    ok: true,
+    step: "synthesize",
+    completedAt: new Date().toISOString(),
+    displayName: asString(job.results.resolve?.displayName) ?? job.target,
+    report,
+    wordCount: report.split(/\s+/).filter(Boolean).length,
+  };
+}
+
+async function askClaudeForDeepDiveReport(
+  env: Env,
+  results: Partial<Record<DeepDiveStep, DeepDiveStepResult>>,
+  learningContext: DeepDiveLearningContext,
+  usage: DeepDiveUsage,
+): Promise<string> {
+  const system = `Sei un analista competitivo per un fotografo di matrimoni di Foggia (Mariano Russo Photo). Analizza il materiale raccolto su un fotografo concorrente e produci un report in italiano con queste sezioni:
+
+1. PROFILO — chi è, da quanto, zona operativa
+2. POSIZIONAMENTO — a che tipo di clientela punta, tono, estetica
+3. NUMERI SOCIAL — follower, engagement rate, frequenza, formati che spinge (dai dati Instagram forniti; cita i numeri)
+4. OFFERTA E PREZZI — servizi e fascia prezzo (dai testi del sito; se i prezzi non sono pubblici, stimali dalla fascia di posizionamento e dichiaralo come stima)
+5. PUNTI DI FORZA — cosa fa bene, con esempi concreti dal materiale
+6. DEBOLEZZE VISIBILI — cosa manca o zoppica (SEO, formati, nicchie scoperte, incoerenze)
+7. AZIONI PER MARIANO — 3 mosse concrete e specifiche, non generiche
+
+Basati SOLO sul materiale fornito. Se un dato manca, dillo, non inventare. Per ogni affermazione fattuale presa da una menzione web, indica la fonte tra parentesi usando il dominio o l'URL presente nel materiale; non citare fonti non fornite.
+
+Controlla i calcoli: non tradurre un valore di post/settimana in una cadenza giornaliera senza fare la conversione corretta (0,1 post/settimana significa circa 1 post ogni 10 settimane, non ogni 10 giorni). Se follower o engagement rate non sono disponibili, non descrivere l'engagement come alto, basso o scarso: dillo non valutabile e limita le osservazioni ai like/view assoluti.
+
+FORMATO TELEGRAM: testo semplice, senza Markdown. Non usare #, **, trattini --- o tabelle. Metti ogni intestazione su una riga propria, nel formato "1. PROFILO", e separa le sezioni con una riga vuota. Massimo 600 parole.`;
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 1000,
+      system: `${system}\n\n${formatDeepDiveLearningContext(learningContext)}`,
+      messages: [{ role: "user", content: `Materiale raccolto:\n${JSON.stringify(compactDeepDiveResults(results))}` }],
+    }),
+  });
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`Claude synthesize error: ${response.status} ${raw}`);
+  const data = JSON.parse(raw) as RawRecord;
+  recordClaudeUsage(usage, data);
+  return claudeTextContent(data);
+}
+
+function compactDeepDiveResults(results: Partial<Record<DeepDiveStep, DeepDiveStepResult>>): RawRecord {
+  const website = asRecord(results.website);
+  const pages = Array.isArray(website.pages) ? website.pages.filter(isRecord).map((page) => ({
+    url: asString(page.url),
+    title: asString(page.title),
+    textContent: (asString(page.textContent) ?? "").slice(0, DEEP_DIVE_WEBSITE_PAGE_TEXT_LIMIT),
+  })) : [];
+  const instagram = asRecord(results.instagram);
+  const posts = Array.isArray(instagram.posts) ? instagram.posts.filter(isRecord).map((post) => ({
+    type: asString(post.type),
+    caption: (asString(post.caption) ?? "").slice(0, 200),
+    likes: asNumber(post.likes),
+    comments: asNumber(post.comments),
+    date: asString(post.date),
+    url: asString(post.url),
+  })) : [];
+  return {
+    resolve: toJsonValue(results.resolve ?? null),
+    instagram: {
+      skipped: instagram.skipped === true,
+      note: asString(instagram.note),
+      profile: toJsonValue(asRecord(instagram.profile)),
+      metrics: toJsonValue(asRecord(instagram.metrics)),
+      posts: toJsonValue(posts),
+    },
+    website: {
+      skipped: website.skipped === true,
+      note: asString(website.note),
+      websiteUrl: asString(website.websiteUrl),
+      pages: toJsonValue(pages),
+    },
+    webMentions: toJsonValue(results["web-mentions"] ?? null),
+  };
+}
+
+function limitDeepDiveReport(report: string): string {
+  return limitTextWords(report, 600);
+}
+
+function limitTextWords(text: string, maxWords: number): string {
+  const words = [...text.matchAll(/\S+/g)];
+  if (words.length <= maxWords) return text.trim();
+  return text.slice(0, words[maxWords].index).trim();
+}
+
+function formatDeepDiveReportForTelegram(report: string): string {
+  return report
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/^\s*---+\s*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 async function saveDeepDiveJob(env: Env, key: string, job: DeepDiveJob): Promise<void> {
+  job.updatedAt = new Date().toISOString();
   await env.SAVERIO_KV.put(key, JSON.stringify(job), { expirationTtl: DEEP_DIVE_JOB_TTL });
 }
 
 function formatDeepDiveCompletion(job: DeepDiveJob): string {
+  const report = asString(job.results.synthesize?.report);
+  if (report) return `🔍 Indagine su «${job.target}» completata.\n\n${report}`;
+
   const lines = [`Indagine su «${job.target}» completata.`];
   const instagram = job.results.instagram;
 
@@ -896,6 +2188,29 @@ function formatDeepDiveCompletion(job: DeepDiveJob): string {
 
   lines.push("\nL'analisi strategica arriverà nell'ultimo step.");
   return lines.join("\n");
+}
+
+async function sendDeepDiveCompletion(env: Env, job: DeepDiveJob): Promise<void> {
+  for (const chunk of splitTelegramReport(formatDeepDiveCompletion(job))) {
+    await sendMessage(env, job.chatId, chunk);
+  }
+}
+
+function splitTelegramReport(text: string, maxLength = 4000): string[] {
+  const chunks: string[] = [];
+  let remaining = text.trim();
+  while (remaining.length > maxLength) {
+    const paragraphBreak = remaining.lastIndexOf("\n\n", maxLength);
+    const lineBreak = remaining.lastIndexOf("\n", maxLength);
+    const wordBreak = remaining.lastIndexOf(" ", maxLength);
+    const splitAt = paragraphBreak > 0 ? paragraphBreak
+      : lineBreak > 0 ? lineBreak
+        : wordBreak > 0 ? wordBreak : maxLength;
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
 }
 
 async function loadHistory(env: Env, chatId: number): Promise<Turn[]> {
@@ -999,6 +2314,19 @@ Questi sono ricordi salvati da Mariano o decisioni già confermate. Usali come c
 ${memoryBlock}`;
 }
 
+function buildSystemPromptWithReads(memories: LongMemory[], reads: SavedRead[]): string {
+  const base = buildSystemPrompt(memories);
+  if (!reads.length) return base;
+  const readBlock = reads
+    .map((read) => `- ${read.title} (${read.url}): ${read.summary}`)
+    .join("\n");
+  return `${base}
+
+## Letture archiviate pertinenti
+Usa queste schede solo se aiutano davvero a rispondere. Sono riassunti di link salvati: non attribuire loro dettagli non presenti e cita il link quando è utile.
+${readBlock}`;
+}
+
 function formatMemoryList(memories: LongMemory[]): string {
   if (!memories.length) return "Non ho ancora ricordi stabili salvati.";
   return "Memoria stabile:\n" + memories.slice(-30).map(m => {
@@ -1027,7 +2355,12 @@ function keywordSet(text: string): Set<string> {
   );
 }
 
-async function askClaude(env: Env, history: Turn[], memories: LongMemory[]): Promise<string> {
+async function askClaude(
+  env: Env,
+  history: Turn[],
+  memories: LongMemory[],
+  reads: SavedRead[] = [],
+): Promise<string> {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -1038,7 +2371,7 @@ async function askClaude(env: Env, history: Turn[], memories: LongMemory[]): Pro
     body: JSON.stringify({
       model: MODEL,
       max_tokens: 1500,
-      system: buildSystemPrompt(memories),
+      system: buildSystemPromptWithReads(memories, reads),
       messages: history,
       tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 4 }],
     }),
@@ -1055,12 +2388,141 @@ async function askClaude(env: Env, history: Turn[], memories: LongMemory[]): Pro
     .join("\n")
     .trim() || "(nessuna risposta)";
 }
-async function sendMessage(env: Env, chatId: number, text: string, options: { menu?: boolean } = {}) {
+async function createPendingAction(
+  env: Env,
+  chatId: number,
+  action: PendingActionType,
+  params: JsonValue,
+): Promise<{ id: string; approveData: string; rejectData: string }> {
+  const id = crypto.randomUUID();
+  const pending: PendingAction = {
+    action,
+    params,
+    chatId,
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + PENDING_ACTION_TTL * 1000).toISOString(),
+  };
+  await env.SAVERIO_KV.put(pendingActionKey(id), JSON.stringify(pending), { expirationTtl: PENDING_ACTION_TTL });
+  return { id, approveData: `pending:approve:${id}`, rejectData: `pending:reject:${id}` };
+}
+
+async function handlePendingActionCallback(env: Env, chatId: number, callbackData: string): Promise<string> {
+  const match = callbackData.match(/^pending:(approve|reject):([0-9a-f-]{36})$/i);
+  if (!match) return "Azione non riconosciuta.";
+  const [, decision, id] = match;
+  const raw = await env.SAVERIO_KV.get(pendingActionKey(id));
+  if (!raw) return "Questa proposta è scaduta o è già stata gestita.";
+
+  let pending: PendingAction;
+  try {
+    pending = JSON.parse(raw) as PendingAction;
+  } catch {
+    await env.SAVERIO_KV.delete(pendingActionKey(id));
+    return "Proposta non leggibile.";
+  }
+  if (pending.chatId !== chatId || Date.parse(pending.expiresAt) <= Date.now()) {
+    await env.SAVERIO_KV.delete(pendingActionKey(id));
+    return "Questa proposta è scaduta.";
+  }
+  if (decision === "reject") {
+    await env.SAVERIO_KV.delete(pendingActionKey(id));
+    return "Proposta rifiutata.";
+  }
+
+  const reply = await executePendingAction(env, pending);
+  await env.SAVERIO_KV.delete(pendingActionKey(id));
+  return reply;
+}
+
+async function executePendingAction(env: Env, pending: PendingAction): Promise<string> {
+  return PENDING_ACTION_HANDLERS[pending.action](env, asRecord(pending.params));
+}
+
+type PendingActionHandler = (env: Env, params: RawRecord) => Promise<string>;
+
+// Registro unico: aggiungere una nuova azione approvabile richiede una sola voce qui.
+const PENDING_ACTION_HANDLERS: Record<PendingActionType, PendingActionHandler> = {
+  "task-open": async (env, params) => {
+    const titolo = asString(params.titolo);
+    if (!titolo) throw new Error("task email senza titolo");
+    const response = await fetch(env.TASK_URL + "/open", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-agent-key": env.AGENT_KEY },
+      body: JSON.stringify({ titolo, urgente: params.urgente === true }),
+    });
+    if (!response.ok) throw new Error(`task/open ${response.status}`);
+    return "Task aperto.";
+  },
+  "skill-merge": async (env, params) => {
+    const lessonIds = Array.isArray(params.lessonIds) ? params.lessonIds.filter((id): id is string => typeof id === "string") : [];
+    const trigger = asString(params.trigger);
+    const rule = asString(params.rule);
+    if (lessonIds.length < 2 || !trigger || !rule) throw new Error("proposta merge non valida");
+    await createFirestoreLesson(env, { trigger, rule });
+    for (const lessonId of lessonIds) await deleteFirestoreDocument(env, `lessons/${lessonId}`);
+    return "Merge lessons approvato e applicato.";
+  },
+  "skill-quarantine": async (env, params) => {
+    const skillId = asString(params.skillId);
+    if (!skillId) throw new Error("proposta quarantena non valida");
+    const document = await getFirestoreDocument(env, `skills/${skillId}`);
+    if (!document) throw new Error("skill non trovata");
+    const current = asNumber(fromFirestoreValue(asRecord(document.fields).harmfulCount)) ?? 0;
+    await patchFirestoreDocument(env, `skills/${skillId}`, {
+      harmfulCount: Math.max(2, current),
+      updatedAt: new Date().toISOString(),
+    });
+    return "Skill messa in quarantena.";
+  },
+  "arretrati-log-event": async (env, params) => {
+    const noteId = asString(params.noteId); const event = asString(params.event) as WorkEventType | null;
+    if (!noteId || !event || !nextEvent(event === "consegnato" ? "in_stampa" : event) && event !== "consegnato") throw new Error("evento arretrati non valido");
+    await appendWorkHistory(env, { noteId, event, detail: asString(params.detail) ?? "aggiornato da digest" });
+    const state = await loadArretratiState(env); delete state.streaks[noteId]; await saveArretratiState(env, state);
+    return "Storico aggiornato.";
+  },
+  "arretrati-suspend": async (env, params) => {
+    const noteId = asString(params.noteId); const text = asString(params.text); const title = asString(params.title) ?? "Scheda";
+    if (!noteId || text === null) throw new Error("scheda arretrati non valida");
+    await setWorkNoteTag(env, { id: noteId, title, text, historyUpdatedAt: null, updatedAt: null, createdAt: null }, "#sospeso", true);
+    await appendWorkHistory(env, { noteId, event: "sospeso_cliente", detail: "sospeso da digest" });
+    const state = await loadArretratiState(env); delete state.streaks[noteId]; await saveArretratiState(env, state);
+    return "Scheda sospesa e Storico aggiornato.";
+  },
+  "arretrati-retry": async (env, params) => {
+    const noteId = asString(params.noteId); if (!noteId) throw new Error("scheda arretrati non valida");
+    const state = await loadArretratiState(env); state.streaks[noteId] = { date: new Date(Date.now() - DAY_MS).toISOString().slice(0, 10), count: 0 }; await saveArretratiState(env, state);
+    return "Va bene: domani te lo ripropongo.";
+  },
+  "arretrati-audit-tag": async (env, params) => {
+    const notes = Array.isArray(params.notes) ? params.notes.filter(isRecord).map((note) => ({ id: asString(note.id) ?? "", title: asString(note.title) ?? "Scheda", text: asString(note.text) ?? "" })).filter((note) => note.id && note.text) : [];
+    if (!notes.length) throw new Error("audit legacy senza schede valide");
+    const tagged = await batchAddRegularizeTag(env, notes);
+    return `${tagged} schede taggate come #daregolarizzare: entreranno nella rotazione del digest da domani.`;
+  },
+};
+
+async function answerCallbackQuery(env: Env, callbackQueryId: string, text: string): Promise<void> {
+  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/answerCallbackQuery`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ callback_query_id: callbackQueryId, text, show_alert: false }),
+  });
+  if (!response.ok) throw new Error(`Telegram callback error: ${response.status}`);
+}
+
+async function sendMessage(
+  env: Env,
+  chatId: number,
+  text: string,
+  options: { menu?: boolean; inlineKeyboard?: TelegramInlineButton[][] } = {},
+) {
   // Telegram taglia oltre 4096 caratteri: spezzo se serve.
   for (let i = 0; i < text.length; i += 4000) {
     try {
       const body: Record<string, unknown> = { chat_id: chatId, text: text.slice(i, i + 4000) };
       if (options.menu && i === 0) body.reply_markup = MAIN_MENU;
+      if (options.inlineKeyboard && i === 0) body.reply_markup = { inline_keyboard: options.inlineKeyboard };
       const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1091,6 +2553,90 @@ function isClientBriefIntent(text: string): boolean {
     || value.includes("cosa sai su")
     || value.includes("dimmi cosa sai di")
     || value.includes("dimmi cosa sai su");
+}
+
+type EmailSearchPlan = { query: string; max: number; newsletterCheck: boolean };
+
+function emailSearchPlan(text: string): EmailSearchPlan | null {
+  const normalized = text.toLowerCase().trim();
+  if (!/\b(?:e-?mail|posta|inbox|newsletter)\b/.test(normalized)) return null;
+
+  const countMatch = normalized.match(/\b(?:ultim[eaie]*|prime)\s+(\d{1,2})\s+e-?mail\b/);
+  const max = countMatch ? Math.max(1, Math.min(30, Number(countMatch[1]))) : 30;
+  const newsletterCheck = /\bnewsletter\b|\biscritt[oaie]*\b/.test(normalized);
+  const safeBase = "-in:spam -in:trash";
+  if (newsletterCheck || /\b(?:ultim[eaie]*|prime)\s+\d*\s*e-?mail\b/.test(normalized)) {
+    return { query: safeBase, max, newsletterCheck };
+  }
+
+  const fromMatch = text.match(/\b(?:email|posta)\s+da\s+([^?.,!]+)|\bda\s+([^?.,!]+)\s+(?:email|posta)\b/i);
+  const sender = (fromMatch?.[1] ?? fromMatch?.[2] ?? "").trim();
+  if (sender) return { query: `${safeBase} from:(${sender.slice(0, 100)})`, max, newsletterCheck: false };
+
+  const terms = text
+    .replace(/\b(?:cerca|cercami|trova|nelle?|ultim[eaie]*|prime|email|e-mail|posta|inbox|messaggi?)\b/gi, " ")
+    .replace(/\b\d{1,2}\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160);
+  return { query: terms ? `${safeBase} ${terms}` : safeBase, max, newsletterCheck: false };
+}
+
+async function gestisciEmail(env: Env, text: string): Promise<string | null> {
+  const plan = emailSearchPlan(text);
+  if (!plan) return null;
+
+  const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "")
+    + `/email/search?q=${encodeURIComponent(plan.query)}&max=${plan.max}`;
+  try {
+    const response = await fetch(endpoint, { headers: { "x-agent-key": env.AGENT_KEY } });
+    if (!response.ok) {
+      const failure = asRecord(await response.json());
+      const code = asString(failure.error);
+      if (code === "gmail_api_disabled") {
+        return "La Gmail API non è ancora abilitata nel progetto Google. Apri Google Cloud Console → API e servizi → Libreria, abilita Gmail API, poi riprova.";
+      }
+      if (code === "gmail_scope_missing") {
+        return "Manca il consenso Gmail. Apri di nuovo il link /auth del backend, accetta Gmail in sola lettura e poi riprova.";
+      }
+      throw new Error(`email/search ${response.status}: ${code ?? "errore non specificato"}`);
+    }
+    const emails = asRecord(await response.json()).emails;
+    if (!Array.isArray(emails)) throw new Error("email/search risposta senza emails");
+    const results = emails.filter(isRecord).slice(0, plan.max);
+    return plan.newsletterCheck
+      ? formatNewsletterCheck(results, plan.max)
+      : formatEmailSearchResults(results, plan.max);
+  } catch (error) {
+    console.error("[FASE-4] Ricerca email fallita:", error);
+    return "Non riesco a consultare la posta in questo momento. Riprova tra poco.";
+  }
+}
+
+function formatNewsletterCheck(emails: RawRecord[], inspected: number): string {
+  const newsletters = emails.filter((email) => email.listUnsubscribe === true
+    || (Array.isArray(email.labels) && email.labels.some((label) => label === "CATEGORY_PROMOTIONS")));
+  if (!newsletters.length) {
+    return `Ho controllato le ultime ${inspected} email: non trovo segnali tecnici di iscrizione a newsletter. È una verifica limitata a questo campione.`;
+  }
+  const rows = newsletters.slice(0, 10).map((email) => {
+    const from = asString(email.from) ?? "mittente sconosciuto";
+    const subject = asString(email.subject) ?? "(senza oggetto)";
+    return `• ${from} — ${subject}`;
+  });
+  return `Nelle ultime ${inspected} email ho trovato ${newsletters.length} possibili newsletter/iscrizioni:\n\n${rows.join("\n")}`;
+}
+
+function formatEmailSearchResults(emails: RawRecord[], inspected: number): string {
+  if (!emails.length) return `Non ho trovato email pertinenti tra le ultime ${inspected} controllate.`;
+  const rows = emails.slice(0, 10).map((email) => {
+    const from = asString(email.from) ?? "mittente sconosciuto";
+    const subject = asString(email.subject) ?? "(senza oggetto)";
+    const snippet = (asString(email.snippet) ?? "").replace(/\s+/g, " ").slice(0, 180);
+    return [`• ${from} — ${subject}`, snippet ? `  ${snippet}` : ""].filter(Boolean).join("\n");
+  });
+  const suffix = emails.length > rows.length ? `\n\nMostro le prime ${rows.length} di ${emails.length}.` : "";
+  return `Ho trovato ${emails.length} email tra le ultime ${inspected} controllate:\n\n${rows.join("\n\n")}${suffix}`;
 }
 
 async function gestisciRiepilogoCliente(env: Env, text: string): Promise<string | null> {
@@ -1263,6 +2809,142 @@ async function createFirestoreReminder(env: Env, reminder: Omit<SaverioReminder,
     }),
   });
   if (!response.ok) throw new Error(`Firestore insert ${response.status}: ${await response.text()}`);
+}
+
+async function createFirestoreDeepDiveReport(env: Env, job: DeepDiveJob, report: string): Promise<void> {
+  job.usage.firestoreWrites += 1;
+  const token = await getFirestoreAccessToken(env);
+  const displayName = asString(job.results.resolve?.displayName) ?? job.target;
+  const response = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT_ID}/databases/(default)/documents/reports`,
+    {
+      method: "POST",
+      headers: { authorization: "Bearer " + token, "content-type": "application/json" },
+      body: JSON.stringify({
+        fields: {
+          target: { stringValue: job.target },
+          displayName: { stringValue: displayName },
+          report: { stringValue: report },
+          rawResults: firestoreValue(toJsonValue(compactDeepDiveResults(job.results))),
+          createdAt: { timestampValue: new Date().toISOString() },
+        },
+      }),
+    },
+  );
+  if (!response.ok) throw new Error(`Firestore reports insert ${response.status}: ${await response.text()}`);
+}
+
+async function writeDeepDiveEpisode(
+  env: Env,
+  job: DeepDiveJob,
+  outcome: "done" | "failed",
+  failedStep: DeepDiveStep | null,
+): Promise<void> {
+  refreshDeepDiveTiming(job);
+  job.usage.firestoreWrites += 1;
+  const token = await getFirestoreAccessToken(env);
+  const steps = job.steps.map((name) => {
+    const execution = job.stepExecutions[name];
+    return {
+      name,
+      durationMs: execution?.durationMs ?? null,
+      retries: execution?.retries ?? job.retryCounts[name] ?? 0,
+      error: execution?.error ?? (name === failedStep ? job.error : null),
+    };
+  });
+  const url = new URL(
+    `https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT_ID}/databases/(default)/documents/episodes/${job.id}`,
+  );
+  url.searchParams.set("currentDocument.exists", "false");
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: { authorization: "Bearer " + token, "content-type": "application/json" },
+    body: JSON.stringify({
+      fields: {
+        jobId: { stringValue: job.id },
+        type: { stringValue: job.type },
+        target: { stringValue: job.target },
+        outcome: { stringValue: outcome },
+        failedStep: failedStep ? { stringValue: failedStep } : { nullValue: null },
+        steps: firestoreValue(toJsonValue(steps)),
+        skillUsed: job.learningContext.skill ? { stringValue: job.learningContext.skill.id } : { nullValue: null },
+        usage: firestoreValue(toJsonValue(job.usage)),
+        timing: firestoreValue(toJsonValue(job.timing)),
+        estimatedClaudeUsd: { doubleValue: estimateClaudeUsd(job.usage) },
+        createdAt: { timestampValue: job.createdAt },
+      },
+    }),
+  });
+  if (response.status === 409) return;
+  if (!response.ok) throw new Error(`Firestore episodes write ${response.status}: ${await response.text()}`);
+}
+
+async function formatDeepDiveCostSummary(env: Env): Promise<string> {
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const totals = emptyDeepDiveUsage();
+  let jobs = 0;
+  let telemetryJobs = 0;
+  let completedMs = 0;
+  let completedWithTiming = 0;
+  let arretratiReads = 0;
+  try { arretratiReads = asNumber(JSON.parse(await env.SAVERIO_KV.get(`arretrati:telemetry:${new Date().toISOString().slice(0, 7)}`) ?? "{}").firestoreReads) ?? 0; } catch { /* telemetria opzionale */ }
+
+  try {
+    const documents = await listFirestoreCollection(env, "episodes");
+    for (const document of documents) {
+      const fields = asRecord(document.fields);
+      const createdAt = asString(fromFirestoreValue(fields.createdAt));
+      if (!createdAt || Date.parse(createdAt) < cutoff) continue;
+      jobs += 1;
+      const usage = asRecord(fromFirestoreValue(fields.usage));
+      if (Object.keys(usage).length) {
+        telemetryJobs += 1;
+        totals.anthropicRequests += asNumber(usage.anthropicRequests) ?? 0;
+        totals.anthropicInputTokens += asNumber(usage.anthropicInputTokens) ?? 0;
+        totals.anthropicOutputTokens += asNumber(usage.anthropicOutputTokens) ?? 0;
+        totals.anthropicWebSearches += asNumber(usage.anthropicWebSearches) ?? 0;
+        totals.geminiEmbeddings += asNumber(usage.geminiEmbeddings) ?? 0;
+        totals.firestoreReads += asNumber(usage.firestoreReads) ?? 0;
+        totals.firestoreWrites += asNumber(usage.firestoreWrites) ?? 0;
+        totals.apifyRuns += asNumber(usage.apifyRuns) ?? 0;
+        totals.apifyHttpRequests += asNumber(usage.apifyHttpRequests) ?? 0;
+        totals.websiteFetches += asNumber(usage.websiteFetches) ?? 0;
+      }
+      const timing = asRecord(fromFirestoreValue(fields.timing));
+      const endToEndMs = asNumber(timing.endToEndMs);
+      if (endToEndMs !== null) {
+        completedMs += endToEndMs;
+        completedWithTiming += 1;
+      }
+    }
+  } catch (error) {
+    console.error("[FASE-2] Lettura telemetria costi fallita:", error);
+    return "Non riesco a leggere la telemetria costi in questo momento. Riprova tra poco.";
+  }
+
+  if (!telemetryJobs) {
+    return `COSTI /INDAGA — ultimi 30 giorni\nJob conclusi: ${jobs}\nNon ci sono ancora job con telemetria: la raccolta parte da questo aggiornamento.`;
+  }
+
+  const averageDuration = completedWithTiming ? Math.round(completedMs / completedWithTiming) : null;
+  return [
+    "COSTI /INDAGA — ultimi 30 giorni",
+    `Job: ${jobs} (${telemetryJobs} con telemetria)`,
+    averageDuration === null ? "Durata media: non disponibile" : `Durata media end-to-end: ${formatDeepDiveDuration(averageDuration)}`,
+    `Claude: ${totals.anthropicRequests} chiamate, ${totals.anthropicInputTokens.toLocaleString("it-IT")} token input, ${totals.anthropicOutputTokens.toLocaleString("it-IT")} output, ${totals.anthropicWebSearches} ricerche`,
+    `Stima Claude: $${estimateClaudeUsd(totals).toFixed(4)} (token + web search; tasse escluse)`,
+    `Gemini embedding: ${totals.geminiEmbeddings}`,
+    `Apify: ${totals.apifyRuns} run, ${totals.apifyHttpRequests} richieste API`,
+    `Firestore: ${totals.firestoreReads} letture, ${totals.firestoreWrites} scritture; Arretrati: ${arretratiReads} letture questo mese; sito: ${totals.websiteFetches} pagine`,
+    "Nota: il costo Apify dipende dal tuo piano/actor e non e incluso nella stima Claude.",
+  ].join("\n");
+}
+
+function formatDeepDiveDuration(durationMs: number): string {
+  const totalSeconds = Math.round(durationMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes ? `${minutes} min ${seconds} s` : `${seconds} s`;
 }
 
 async function processDuePromemoria(env: Env): Promise<void> {
@@ -1783,6 +3465,175 @@ function escapeHtml(value: string): string {
 
 // ===== Fase 1: signal bus + digest mattutino =====
 
+// ===== Arretrati: schede lavoro Firestore =====
+
+const WORK_NOTES_UID = "nL8Wwa2SktYjLeEHS51AZyFGEMD3";
+const ARRETRATI_STREAK_KEY = "arretrati:state"; // unica chiave: evita un read/write KV per scheda
+const ARRETRATI_REGULARIZE_INPUT_KEY = "arretrati:regularize-input";
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+export const ARRETRATI_THRESHOLDS = {
+  servizio_svolto: { attention: 45, critical: 60 },
+  galleria_inviata: { attention: 7, critical: 14 },
+  cliente_risposto: { attention: 5, critical: 10 },
+  modifiche_fatte: { attention: 7, critical: 14 },
+  album_confermato: { attention: 5, critical: 10 },
+  in_stampa: { attention: 15, critical: 25 },
+} as const;
+type WorkEventType = keyof typeof ARRETRATI_THRESHOLDS | "consegnato" | "sospeso_cliente";
+type WorkNote = { id: string; title: string; text: string; historyUpdatedAt: number | null; updatedAt: number | null; createdAt: number | null };
+type WorkCandidate = WorkNote & { event: WorkEventType; eventAt: number; days: number; score: number; attention: number; detail: string };
+type LegacyAuditCandidate = WorkNote & { lastModifiedAt: number; auditReason: "nessun evento" | "solo Stato legacy" };
+type ArretratiState = { streaks: Record<string, { date: string; count: number }>; regularizeIndex: number };
+
+function hasTag(text: string, tag: string): boolean { return new RegExp(`(^|\\s)${tag}(?=\\s|$)`, "i").test(text); }
+function priorityMultiplier(text: string): number {
+  if (hasTag(text, "#obbligatorio")) return 4;
+  if (hasTag(text, "#importante")) return 2;
+  if (hasTag(text, "#dasistemare")) return 1.5;
+  if (hasTag(text, "#quandohotempo")) return 0.5;
+  return 1;
+}
+function noteTitle(text: string, fallback: string): string {
+  return text.split("\n").map((line) => line.trim()).find((line) => line && !line.startsWith("#") && !line.includes("📌 Storico"))?.replace(/^#+\s*/, "") ?? fallback;
+}
+function firestoreTimestamp(value: unknown): number | null {
+  if (typeof value === "string") { const date = Date.parse(value); return Number.isFinite(date) ? date : null; }
+  if (isRecord(value)) { const seconds = asNumber(value.seconds); return seconds === null ? null : seconds * 1000; }
+  return null;
+}
+function parseLatestHistory(text: string): { event: WorkEventType; at: number | null; detail: string } | null {
+  const section = text.indexOf("📌 Storico");
+  if (section < 0) return null;
+  const line = text.slice(section + "📌 Storico".length).split("\n").map((item) => item.trim()).find((item) => /^\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2}\s*[·•]/.test(item));
+  if (!line) return null;
+  const match = line.match(/^(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2})\s*[·•]\s*([a-z_]+)(?:\s*[·•]\s*(.*))?$/i);
+  if (!match) return null;
+  const event = match[5] as WorkEventType;
+  if (!(event in ARRETRATI_THRESHOLDS) && event !== "consegnato" && event !== "sospeso_cliente") return null;
+  const now = new Date();
+  let at = new Date(now.getFullYear(), Number(match[2]) - 1, Number(match[1]), Number(match[3]), Number(match[4])).getTime();
+  if (at > Date.now() + DAY_MS) at = new Date(now.getFullYear() - 1, Number(match[2]) - 1, Number(match[1]), Number(match[3]), Number(match[4])).getTime();
+  return { event, at, detail: match[6]?.trim() ?? "" };
+}
+function nextEvent(event: WorkEventType): { event: WorkEventType; label: string; step: string } | null {
+  const map: Partial<Record<WorkEventType, { event: WorkEventType; label: string; step: string }>> = {
+    servizio_svolto: { event: "galleria_inviata", label: "📤 Galleria inviata", step: "inviare la galleria" },
+    galleria_inviata: { event: "cliente_risposto", label: "✅ Cliente ha risposto", step: "sollecitare risposta cliente" },
+    cliente_risposto: { event: "modifiche_fatte", label: "✅ Modifiche fatte", step: "chiudere le modifiche" },
+    modifiche_fatte: { event: "album_confermato", label: "✅ Album confermato", step: "ottenere conferma album" },
+    album_confermato: { event: "in_stampa", label: "🖨️ Mandato in stampa", step: "mandare in stampa" },
+    in_stampa: { event: "consegnato", label: "✅ Consegnato", step: "verificare e consegnare" },
+  };
+  return map[event] ?? null;
+}
+async function listArretratiNotes(env: Env): Promise<{ notes: WorkNote[]; reads: number }> {
+  const token = await getFirestoreAccessToken(env);
+  const response = await fetch(`https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT_ID}/databases/(default)/documents:runQuery`, {
+    method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" },
+    body: JSON.stringify({ structuredQuery: { from: [{ collectionId: "notes" }], where: { fieldFilter: { field: { fieldPath: "uid" }, op: "EQUAL", value: { stringValue: WORK_NOTES_UID } } }, limit: 500 } }),
+  });
+  if (!response.ok) throw new Error(`Firestore notes query ${response.status}: ${await response.text()}`);
+  const rows = await response.json() as unknown[];
+  const notes = (Array.isArray(rows) ? rows : []).map((row) => asRecord(asRecord(row).document)).filter((document) => Object.keys(document).length).map((document) => {
+    const fields = asRecord(document.fields); const text = asString(fromFirestoreValue(fields.text)) ?? "";
+    return { id: firestoreDocumentId(asString(document.name) ?? ""), title: noteTitle(text, "Scheda senza titolo"), text, historyUpdatedAt: firestoreTimestamp(fromFirestoreValue(fields.historyUpdatedAt)), updatedAt: firestoreTimestamp(document.updateTime) ?? firestoreTimestamp(fromFirestoreValue(fields.updatedAt)), createdAt: firestoreTimestamp(fromFirestoreValue(fields.createdAt)) };
+  }).filter((note) => Boolean(note.id));
+  return { notes, reads: notes.length };
+}
+// Fonte unica per digest e /Lavori. Non aggiorna KV: il chiamante decide se la lettura è passiva o il cron.
+async function getArretratiRanking(env: Env): Promise<{ notes: WorkNote[]; reads: number; ranking: WorkCandidate[] }> {
+  const { notes, reads } = await listArretratiNotes(env);
+  const now = Date.now();
+  const ranking = notes.map((note): WorkCandidate | null => {
+    if (hasTag(note.text, "#sospeso") || hasTag(note.text, "#daregolarizzare")) return null;
+    const history = parseLatestHistory(note.text);
+    if (!history || history.event === "consegnato" || history.event === "sospeso_cliente" || !(history.event in ARRETRATI_THRESHOLDS)) return null;
+    const eventAt = note.historyUpdatedAt ?? history.at;
+    if (!eventAt) return null;
+    const days = Math.max(0, Math.floor((now - eventAt) / DAY_MS));
+    const attention = ARRETRATI_THRESHOLDS[history.event as keyof typeof ARRETRATI_THRESHOLDS].attention;
+    return { ...note, event: history.event, eventAt, days, attention, score: Math.min(days / attention * priorityMultiplier(note.text), 3), detail: history.detail };
+  }).filter((item): item is WorkCandidate => item !== null)
+    .filter((item) => item.score >= 1)
+    .sort((a, b) => b.score - a.score || b.days - a.days);
+  return { notes, reads, ranking };
+}
+function formatArretratiRanking(ranking: WorkCandidate[]): string {
+  if (!ranking.length) return "📋 LAVORI\n\nNessun arretrato oltre la soglia di attenzione.";
+  return ["📋 LAVORI", "", ...ranking.slice(0, 5).map((item, index) => {
+    const step = nextEvent(item.event)?.step ?? "verificare";
+    return `${index + 1}. ${item.title}\n   ${item.event} da ${item.days}gg · soglia ${item.attention}gg · score ${item.score.toFixed(1)}\n   Prossimo passo: ${step}`;
+  })].join("\n");
+}
+const LEGACY_AUDIT_STALE_DAYS = 60;
+function isLegacyWorkCard(note: WorkNote): boolean {
+  // Stato è il segnale più affidabile delle schede pre-Storico; il titolo copre le vecchie schede senza Stato.
+  return /📌\s*Stato\s*:/i.test(note.text) || /\b(matrimonio|battesimo)\b/i.test(note.title);
+}
+async function getLegacyAuditCandidates(env: Env): Promise<LegacyAuditCandidate[]> {
+  const { notes } = await listArretratiNotes(env); const staleBefore = Date.now() - LEGACY_AUDIT_STALE_DAYS * DAY_MS;
+  return notes.map((note): LegacyAuditCandidate | null => {
+    if (!isLegacyWorkCard(note) || hasTag(note.text, "#daregolarizzare")) return null;
+    const history = parseLatestHistory(note.text); if (history) return null;
+    const lastModifiedAt = note.updatedAt ?? note.createdAt; if (!lastModifiedAt || lastModifiedAt > staleBefore) return null;
+    return { ...note, lastModifiedAt, auditReason: /📌\s*Stato\s*:/i.test(note.text) ? "solo Stato legacy" : "nessun evento" };
+  }).filter((note): note is LegacyAuditCandidate => note !== null).sort((left, right) => left.lastModifiedAt - right.lastModifiedAt);
+}
+function formatAuditDate(timestamp: number): string { return new Intl.DateTimeFormat("it-IT", { day: "2-digit", month: "2-digit", year: "numeric", timeZone: "Europe/Rome" }).format(new Date(timestamp)); }
+async function batchAddRegularizeTag(env: Env, notes: Array<{ id: string; title: string; text: string }>): Promise<number> {
+  const updates = notes.filter((note) => note.id && !hasTag(note.text, "#daregolarizzare")).slice(0, 500);
+  if (!updates.length) return 0;
+  const token = await getFirestoreAccessToken(env);
+  const writes = updates.map((note) => ({ update: { name: `projects/${FIRESTORE_PROJECT_ID}/databases/(default)/documents/notes/${note.id}`, fields: { text: firestoreValue(`${note.text.trim()} #daregolarizzare`) } }, updateMask: { fieldPaths: ["text"] } }));
+  const response = await fetch(`https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT_ID}/databases/(default)/documents:batchWrite`, { method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: JSON.stringify({ writes }) });
+  if (!response.ok) throw new Error(`Firestore audit batch ${response.status}: ${await response.text()}`);
+  const statuses = asRecord(await response.json()).status;
+  if (Array.isArray(statuses) && statuses.some((status) => (asNumber(asRecord(status).code) ?? 0) !== 0)) throw new Error("Firestore audit batch con scritture fallite");
+  return updates.length;
+}
+async function loadArretratiState(env: Env): Promise<ArretratiState> {
+  try { const parsed = JSON.parse(await env.SAVERIO_KV.get(ARRETRATI_STREAK_KEY) ?? "{}"); return { streaks: isRecord(parsed.streaks) ? parsed.streaks as ArretratiState["streaks"] : {}, regularizeIndex: asNumber(parsed.regularizeIndex) ?? 0 }; }
+  catch { return { streaks: {}, regularizeIndex: 0 }; }
+}
+async function saveArretratiState(env: Env, state: ArretratiState): Promise<void> { await env.SAVERIO_KV.put(ARRETRATI_STREAK_KEY, JSON.stringify(state)); }
+async function incrementArretratiReadTelemetry(env: Env, reads: number): Promise<void> {
+  const key = `arretrati:telemetry:${new Date().toISOString().slice(0, 7)}`; const raw = await env.SAVERIO_KV.get(key);
+  const current = raw ? asNumber(JSON.parse(raw).firestoreReads) ?? 0 : 0; await env.SAVERIO_KV.put(key, JSON.stringify({ firestoreReads: current + reads }));
+}
+function formatRegularize(note: WorkNote): string { const status = note.text.match(/📌\s*Stato:\s*([^\n]+)/i)?.[1]?.trim(); return `Da regolarizzare: ${note.title} — nessuno Storico${status ? `, solo Stato: ${status}` : ""}. Quando l'hai iniziato?`; }
+async function appendWorkHistory(env: Env, params: { noteId: string; event: WorkEventType; detail: string; occurredAt?: string }): Promise<void> {
+  if (!env.BLOCNOTES_AI_URL) throw new Error("BLOCNOTES_AI_URL mancante");
+  const response = await fetch(env.BLOCNOTES_AI_URL.replace(/\/$/, "") + "/append-history", { method: "POST", headers: { "content-type": "application/json", "x-agent-key": env.AGENT_KEY }, body: JSON.stringify(params) });
+  if (!response.ok) throw new Error(`append-history ${response.status}: ${await response.text()}`);
+}
+async function setWorkNoteTag(env: Env, note: WorkNote, tag: string, present: boolean): Promise<void> {
+  const text = present ? (hasTag(note.text, tag) ? note.text : `${note.text.trim()} ${tag}`) : note.text.replace(new RegExp(`(^|\\s)${tag}(?=\\s|$)`, "ig"), "$1").replace(/[ \t]+\n/g, "\n");
+  await patchFirestoreDocument(env, `notes/${note.id}`, { text });
+}
+function inferWorkEvent(text: string): WorkEventType {
+  const normalized = text.toLowerCase();
+  if (normalized.includes("galleria")) return "galleria_inviata";
+  if (normalized.includes("rispost")) return "cliente_risposto";
+  if (normalized.includes("modific")) return "modifiche_fatte";
+  if (normalized.includes("album")) return "album_confermato";
+  if (normalized.includes("stamp")) return "in_stampa";
+  if (normalized.includes("consegn")) return "consegnato";
+  return "servizio_svolto";
+}
+async function handleRegularizeInput(env: Env, chatId: number, text: string): Promise<string | null> {
+  if (chatId !== OWNER_CHAT_ID) return null;
+  const raw = await env.SAVERIO_KV.get(ARRETRATI_REGULARIZE_INPUT_KEY); if (!raw) return null;
+  let pending: { noteId?: string; title?: string; text?: string }; try { pending = JSON.parse(raw); } catch { await env.SAVERIO_KV.delete(ARRETRATI_REGULARIZE_INPUT_KEY); return null; }
+  if (!pending.noteId || !pending.text) return null;
+  const dateMatch = text.match(/\b(\d{1,2}\/\d{1,2})(?:\/(\d{2,4}))?\b/); let occurredAt: string | undefined;
+  if (dateMatch) { const [day, month] = dateMatch[1].split("/"); const year = dateMatch[2] ? Number(dateMatch[2].length === 2 ? `20${dateMatch[2]}` : dateMatch[2]) : new Date().getFullYear(); occurredAt = new Date(year, Number(month) - 1, Number(day), 12).toISOString(); }
+  await appendWorkHistory(env, { noteId: pending.noteId, event: inferWorkEvent(text), detail: text, ...(occurredAt ? { occurredAt } : {}) });
+  await setWorkNoteTag(env, { id: pending.noteId, title: pending.title ?? "Scheda", text: pending.text, historyUpdatedAt: null, updatedAt: null, createdAt: null }, "#daregolarizzare", false);
+  await env.SAVERIO_KV.delete(ARRETRATI_REGULARIZE_INPUT_KEY);
+  return "Perfetto: primo evento registrato e scheda rimessa nel flusso normale.";
+}
+
 type JsonPrimitive = string | number | boolean | null;
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 type RawRecord = Record<string, unknown>;
@@ -1796,35 +3647,119 @@ type Signal = {
   urgency: string;
   createdAt: string | null;
 };
+type DigestResult = { text: string; quoteRequests: Array<{ messageId: string; title: string }> };
 
 const DIGEST_SYSTEM_PROMPT = "Sei Saverio, chief of staff di Mariano. Ricevi: segnali dai sistemi di\n"
-  + "monitoraggio (competitor Instagram, bandi pubblici), task aperti con\n"
+  + "monitoraggio (competitor Instagram, bandi pubblici), agenda di oggi e task aperti con\n"
   + "eventuali scadenze. Produci un digest mattutino in italiano, asciutto,\n"
   + "max 12 righe, ordinato per urgenza. Raggruppa per tema. Niente\n"
   + "convenevoli. Se non c'è NULLA che meriti attenzione oggi (nessun\n"
-  + "segnale, nessuna scadenza entro 7 giorni), rispondi esattamente con la\n"
-  + "parola SILENZIO e nient'altro.";
+  + "segnale, nessuna scadenza entro 7 giorni), usa text=SILENZIO. Per le\n"
+  + "email mostra solo richiede azione o da leggere; ignora newsletter, promo\n"
+  + "e messaggi irrilevanti. Per ogni preventivo che richiede azione, aggiungi\n"
+  + "messageId e un titolo task in quoteRequests. Rispondi SOLO JSON valido:\n"
+  + "{\"text\":\"digest max 12 righe o SILENZIO\",\"quoteRequests\":[{\"messageId\":\"...\",\"title\":\"...\"}]}.";
 
 async function runMorningDigest(env: Env): Promise<void> {
   try {
+    await ingestRecentEmailsAsSignals(env);
     const signals = await getUnseenSignals(env);
-    const tasks = await fetchOpenTasksForDigest(env);
-    const digest = await createMorningDigest(env, signals, tasks);
+    const [tasks, agenda] = await Promise.all([
+      fetchOpenTasksForDigest(env),
+      fetchTodayCalendarForDigest(env),
+    ]);
+    const digest = await createMorningDigest(env, signals, tasks, agenda);
 
-    if (digest === "SILENZIO") {
+    if (digest.text === "SILENZIO") {
       await markSignalsSeen(env, signals);
+      await runArretratiDigest(env);
+      await runChiefFollowupsDigest(env);
       console.log("[FASE-1] Digest silenzioso; " + signals.length + " segnali marcati come visti.");
       return;
     }
 
     // I segnali vengono marcati solo dopo che Telegram ha confermato l'invio.
-    await sendMessage(env, OWNER_CHAT_ID, digest);
+    await sendMessage(env, OWNER_CHAT_ID, digest.text);
+    for (const quoteRequest of digest.quoteRequests) {
+      const pending = await createPendingAction(env, OWNER_CHAT_ID, "task-open", {
+        titolo: quoteRequest.title,
+        urgente: true,
+        messageId: quoteRequest.messageId,
+      });
+      await sendMessage(
+        env,
+        OWNER_CHAT_ID,
+        `Email preventivo: ${quoteRequest.title}`,
+        { inlineKeyboard: [[{ text: "✅ Apri task", callback_data: pending.approveData }, { text: "❌ Ignora", callback_data: pending.rejectData }]] },
+      );
+    }
     await markSignalsSeen(env, signals);
+    await runArretratiDigest(env);
+    await runChiefFollowupsDigest(env);
     console.log("[FASE-1] Digest inviato; " + signals.length + " segnali marcati come visti.");
   } catch (error) {
     // In caso di errore non marchiamo nulla: il segnale rientra nel prossimo digest.
     console.error("[FASE-1] Digest mattutino fallito:", error);
   }
+}
+
+type ChiefFollowup = { title: string; azione: string; scadenza: string | null; score: number };
+
+async function runChiefFollowupsDigest(env: Env): Promise<void> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + "/chief/oggi";
+    const response = await fetch(endpoint, { headers: { "x-agent-key": env.AGENT_KEY }, signal: controller.signal });
+    if (!response.ok) throw new Error(`chief/oggi ${response.status}`);
+    const body = asRecord(await response.json());
+    const followups = (Array.isArray(body.openFollowups) ? body.openFollowups : []).filter(isRecord).map((item): ChiefFollowup | null => {
+      const title = asString(item.title); const azione = asString(item.azione);
+      if (!title || !azione) return null;
+      return { title, azione, scadenza: asString(item.scadenza), score: asNumber(item.score) ?? 0 };
+    }).filter((item): item is ChiefFollowup => item !== null);
+    const lines = ["📋 Altri lavori fermi (da Chief)", "", ...(followups.length ? followups.slice(0, 5).map((item, index) => `${index + 1}. ${item.azione}${item.scadenza ? ` — scadenza ${item.scadenza}` : ""}`) : ["Nessun follow-up Chief aperto."])];
+    await sendMessage(env, OWNER_CHAT_ID, lines.join("\n"));
+  } catch (error) {
+    console.error("[CHIEF] Follow-up digest non disponibile:", error);
+    await sendMessage(env, OWNER_CHAT_ID, "📋 Altri lavori fermi (da Chief)\n\nFollow-up Chief non disponibile.");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function runArretratiDigest(env: Env): Promise<void> {
+  try {
+    const { notes, reads, ranking: candidates } = await getArretratiRanking(env);
+    await incrementArretratiReadTelemetry(env, reads);
+    const now = Date.now(); const state = await loadArretratiState(env);
+    const regularize = notes.filter((note) => hasTag(note.text, "#daregolarizzare"));
+    const today = new Date().toISOString().slice(0, 10); let primary = candidates[0]; let skipped = false;
+    if (primary) { const previous = state.streaks[primary.id]; const count = previous?.date === today ? previous.count : (previous?.date === new Date(now - DAY_MS).toISOString().slice(0, 10) ? previous.count + 1 : 1); state.streaks[primary.id] = { date: today, count }; skipped = count >= 4; if (skipped) primary = candidates[1]; }
+    for (const id of Object.keys(state.streaks)) if (!candidates.some((candidate) => candidate.id === id)) delete state.streaks[id];
+    await saveArretratiState(env, state);
+    if (skipped && candidates[0]) {
+      const note = candidates[0]; const suspend = await createPendingAction(env, OWNER_CHAT_ID, "arretrati-suspend", { noteId: note.id, text: note.text, title: note.title });
+      const retry = await createPendingAction(env, OWNER_CHAT_ID, "arretrati-retry", { noteId: note.id });
+      await sendMessage(env, OWNER_CHAT_ID, `${note.title} resta il più urgente ma lo salto: è la 4ª volta che te lo propongo.\nVuoi sospenderlo?`, { inlineKeyboard: [[{ text: "⏸️ Sì, sospendi", callback_data: suspend.approveData }, { text: "🔁 No, riproponimelo", callback_data: retry.approveData }]] });
+    }
+    if (primary) {
+      const next = nextEvent(primary.event); if (next) {
+        const action = await createPendingAction(env, OWNER_CHAT_ID, "arretrati-log-event", { noteId: primary.id, event: next.event, title: primary.title });
+        const suspend = await createPendingAction(env, OWNER_CHAT_ID, "arretrati-suspend", { noteId: primary.id, text: primary.text, title: primary.title });
+        const done = await createPendingAction(env, OWNER_CHAT_ID, "arretrati-log-event", { noteId: primary.id, event: next.event, title: primary.title, detail: "recuperato da digest" });
+        const secondary = candidates.find((candidate) => candidate.id !== primary!.id);
+        const text = ["⚠️ ARRETRATI", "", `Oggi recupera: ${primary.title}`, `Fermo da ${primary.days}gg su "${primary.event}" (soglia ${primary.attention}gg · score ${primary.score.toFixed(1)})`, `Prossimo passo: ${next.step}`, secondary ? "" : "", secondary ? `Se hai 10 minuti: ${secondary.title} — ${secondary.event} da ${secondary.days}gg, ${nextEvent(secondary.event)?.step ?? "verificare"}` : ""].filter(Boolean).join("\n");
+        await sendMessage(env, OWNER_CHAT_ID, text, { inlineKeyboard: [[{ text: next.label, callback_data: action.approveData }, { text: "⏸️ Sospendi", callback_data: suspend.approveData }, { text: "✔️ Già fatto", callback_data: done.approveData }]] });
+      }
+    }
+    if (regularize.length) { const note = regularize[state.regularizeIndex % regularize.length]; state.regularizeIndex = (state.regularizeIndex + 1) % regularize.length; await saveArretratiState(env, state); await env.SAVERIO_KV.put(ARRETRATI_REGULARIZE_INPUT_KEY, JSON.stringify({ noteId: note.id, title: note.title, text: note.text }), { expirationTtl: DAY_MS / 1000 }); await sendMessage(env, OWNER_CHAT_ID, formatRegularize(note)); }
+    const suspended = notes.filter((note) => hasTag(note.text, "#sospeso")).map((note) => {
+      const history = parseLatestHistory(note.text); const days = history?.event === "sospeso_cliente" && history.at ? Math.floor((now - history.at) / DAY_MS) : -1;
+      return { note, days };
+    }).filter((item) => item.days > 30).sort((a, b) => b.days - a.days);
+    if (suspended.length) await sendMessage(env, OWNER_CHAT_ID, `⏸️ ${suspended.length} lavori in pausa da oltre 30gg: ${suspended.map(({ note, days }) => `${note.title} (${days}gg)`).join(", ")}`);
+  } catch (error) { console.error("[ARRETRATI] Digest fallito:", error); }
 }
 
 async function fetchOpenTasksForDigest(env: Env): Promise<JsonValue[]> {
@@ -1852,10 +3787,16 @@ async function fetchOpenTasksForDigest(env: Env): Promise<JsonValue[]> {
   throw lastError instanceof Error ? lastError : new Error("task/open non disponibile");
 }
 
-async function createMorningDigest(env: Env, signals: Signal[], tasks: JsonValue[]): Promise<string> {
+async function createMorningDigest(
+  env: Env,
+  signals: Signal[],
+  tasks: JsonValue[],
+  agenda: JsonValue[],
+): Promise<DigestResult> {
   const userPayload = JSON.stringify({
     signals: signals.map(({ documentPath: _documentPath, ...signal }) => signal),
     tasks,
+    agenda,
   });
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -1881,12 +3822,74 @@ async function createMorningDigest(env: Env, signals: Signal[], tasks: JsonValue
       .map((block) => asString(block.text) ?? "")
       .join("\n")
       .trim();
-    if (!text) throw new Error("Claude digest senza testo");
-    return text;
+    const parsed = parseJsonRecord(text);
+    if (!parsed) throw new Error("Claude digest senza JSON valido");
+    const digestText = asString(parsed.text)?.trim();
+    if (!digestText) throw new Error("Claude digest senza testo");
+    const quoteRequests = Array.isArray(parsed.quoteRequests) ? parsed.quoteRequests.filter(isRecord).map((request) => ({
+      messageId: asString(request.messageId) ?? "",
+      title: asString(request.title) ?? "",
+    })).filter((request) => request.messageId && request.title) : [];
+    return { text: digestText, quoteRequests };
   } catch (error) {
     console.error("[FASE-1] Claude digest fallito:", error);
     throw error;
   }
+}
+
+async function fetchTodayCalendarForDigest(env: Env): Promise<JsonValue[]> {
+  const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + "/calendar/today";
+  try {
+    const response = await fetch(endpoint, { headers: { "x-agent-key": env.AGENT_KEY } });
+    if (!response.ok) throw new Error(`calendar/today ${response.status}`);
+    const events = asRecord(await response.json()).events;
+    if (!Array.isArray(events)) throw new Error("calendar/today risposta senza events");
+    return events.map(toJsonValue);
+  } catch (error) {
+    console.error("[FASE-4] Calendar today fallito:", error);
+    return [];
+  }
+}
+
+async function ingestRecentEmailsAsSignals(env: Env): Promise<void> {
+  const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + "/email/scan?hours=24";
+  try {
+    const response = await fetch(endpoint, { headers: { "x-agent-key": env.AGENT_KEY } });
+    if (!response.ok) throw new Error(`email/scan ${response.status}`);
+    const emails = asRecord(await response.json()).emails;
+    if (!Array.isArray(emails)) throw new Error("email/scan risposta senza emails");
+    for (const rawEmail of emails.filter(isRecord).slice(0, 30)) {
+      const id = asString(rawEmail.id);
+      if (!id || await env.SAVERIO_KV.get(`email-seen:${id}`)) continue;
+      await createEmailSignal(env, rawEmail);
+      await env.SAVERIO_KV.put(`email-seen:${id}`, "1", { expirationTtl: 60 * 60 * 24 * 7 });
+    }
+  } catch (error) {
+    console.error("[FASE-4] Email scan fallito:", error);
+  }
+}
+
+async function createEmailSignal(env: Env, email: RawRecord): Promise<void> {
+  const token = await getFirestoreAccessToken(env);
+  const from = asString(email.from) ?? "mittente sconosciuto";
+  const subject = asString(email.subject) ?? "(senza oggetto)";
+  const response = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT_ID}/databases/(default)/documents/signals`,
+    {
+      method: "POST",
+      headers: { authorization: "Bearer " + token, "content-type": "application/json" },
+      body: JSON.stringify({ fields: {
+        source: { stringValue: "email-scan" },
+        type: { stringValue: "email" },
+        summary: { stringValue: `Email da ${from}: ${subject}` },
+        urgency: { stringValue: "da-classificare" },
+        payload: firestoreValue(toJsonValue(email)),
+        seen: { booleanValue: false },
+        createdAt: { timestampValue: new Date().toISOString() },
+      } }),
+    },
+  );
+  if (!response.ok) throw new Error(`Firestore email signal ${response.status}: ${await response.text()}`);
 }
 
 async function getUnseenSignals(env: Env): Promise<Signal[]> {
@@ -2050,6 +4053,25 @@ function toJsonValue(value: unknown): JsonValue {
     return output;
   }
   return String(value);
+}
+
+function firestoreValue(value: JsonValue): unknown {
+  if (value === null) return { nullValue: null };
+  if (typeof value === "string") return { stringValue: value };
+  if (typeof value === "boolean") return { booleanValue: value };
+  if (typeof value === "number") return Number.isInteger(value)
+    ? { integerValue: String(value) }
+    : { doubleValue: value };
+  if (Array.isArray(value)) return { arrayValue: { values: value.map(firestoreValue) } };
+  const fields: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) fields[key] = firestoreValue(child);
+  return { mapValue: { fields } };
+}
+
+function firestoreMap(values: Record<string, JsonValue>): Record<string, unknown> {
+  const fields: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(values)) fields[key] = firestoreValue(value);
+  return fields;
 }
 
 function isRecord(value: unknown): value is RawRecord {
