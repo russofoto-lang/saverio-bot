@@ -149,8 +149,9 @@ Una persona, tre brand: Mariano Russo Photo (matrimoni), BellaVita Eventi (produ
 Se Mariano ti fa una domanda che non c'entra con l'agenzia (curiosità, attualità, tecnologia, sport, vita privata), rispondi normalmente da persona informata — non forzare il contesto agenzia, non riportare tutto al lavoro se non serve. Resti Saverio, cambi solo argomento.
 
 ## Calendario
-- Puoi leggere gli eventi in calendario di oggi e domani. Se Mariano te lo chiede, parlane in prima persona: hai accesso all'agenda e puoi mostrargliela.
-- Puoi proporre la creazione di un evento quando Mariano ti dà titolo, data e orario. Non puoi mai dire che l'hai creato o farlo creare automaticamente: prima deve ricevere e confermare esplicitamente il riepilogo con il pulsante ✅ Crea.
+- Hai accesso a Google Calendar: puoi leggere gli eventi di oggi e domani e puoi mostrargli l'agenda in prima persona.
+- Non hai accesso ad altri calendari esterni, come Outlook, se non sono stati collegati esplicitamente.
+- Puoi proporre la creazione, la modifica o la cancellazione di un evento. Non puoi mai applicare una di queste operazioni automaticamente: prima Mariano deve ricevere e confermare esplicitamente il riepilogo con il relativo pulsante.
 - Se una formulazione non attiva il comando Calendar in quel turno, non negare la capacità: spiega in modo naturale che puoi controllare l'agenda o preparare una proposta di evento da confermare.
 
 ## Concorrenti e mercato locale
@@ -565,7 +566,7 @@ type DeepDiveJob = {
   error: string | null;
 };
 type TelegramInlineButton = { text: string; callback_data: string };
-type PendingActionType = "task-open" | "skill-merge" | "skill-quarantine" | "arretrati-log-event" | "arretrati-suspend" | "arretrati-retry" | "arretrati-audit-tag" | "calendar-create";
+type PendingActionType = "task-open" | "skill-merge" | "skill-quarantine" | "arretrati-log-event" | "arretrati-suspend" | "arretrati-retry" | "arretrati-audit-tag" | "calendar-create" | "calendar-update" | "calendar-delete";
 type PendingAction = {
   action: PendingActionType;
   params: JsonValue;
@@ -2481,7 +2482,7 @@ async function handlePendingActionCallback(env: Env, chatId: number, callbackDat
   return {
     reply,
     action: pending.action,
-    ...(pending.action === "calendar-create" ? { persistentMessage: `✅ ${reply}` } : {}),
+    ...(pending.action.startsWith("calendar-") ? { persistentMessage: `✅ ${reply}` } : {}),
   };
 }
 
@@ -2573,6 +2574,45 @@ const PENDING_ACTION_HANDLERS: Record<PendingActionType, PendingActionHandler> =
     const id = asString(body.id);
     if (!response.ok || !id) throw new Error(`calendar/create-event ${response.status}`);
     return `Evento creato: ${title}\n${formatCalendarDate(startAt, allDay)} (ID ${id}).`;
+  },
+  "calendar-update": async (env, params) => {
+    const eventId = asString(params.eventId);
+    const etag = asString(params.etag);
+    const currentTitle = asString(params.currentTitle) ?? "Evento";
+    if (!eventId || !etag) throw new Error("proposta modifica calendario non valida");
+    const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + `/calendar/events/${encodeURIComponent(eventId)}`;
+    const response = await fetch(endpoint, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", "x-agent-key": env.AGENT_KEY },
+      body: JSON.stringify({
+        etag,
+        ...(asString(params.title) ? { title: asString(params.title) } : {}),
+        ...(asString(params.start) ? { start: asString(params.start) } : {}),
+        ...(asString(params.end) ? { end: asString(params.end) } : {}),
+        ...(asString(params.location) ? { location: asString(params.location) } : {}),
+        ...(asString(params.description) ? { description: asString(params.description) } : {}),
+      }),
+    });
+    if (response.status === 409) throw new Error("L'evento è cambiato nel frattempo: rileggilo e riprova.");
+    if (response.status === 404) throw new Error("L'evento non esiste più.");
+    if (!response.ok) throw new Error(`calendar update ${response.status}`);
+    return `Evento modificato: ${asString(params.title) ?? currentTitle}.`;
+  },
+  "calendar-delete": async (env, params) => {
+    const eventId = asString(params.eventId);
+    const etag = asString(params.etag);
+    const title = asString(params.title) ?? "Evento";
+    if (!eventId || !etag) throw new Error("proposta cancellazione calendario non valida");
+    const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + `/calendar/events/${encodeURIComponent(eventId)}`;
+    const response = await fetch(endpoint, {
+      method: "DELETE",
+      headers: { "content-type": "application/json", "x-agent-key": env.AGENT_KEY },
+      body: JSON.stringify({ etag }),
+    });
+    if (response.status === 409) throw new Error("L'evento è cambiato nel frattempo: rileggilo e riprova.");
+    if (response.status === 404) throw new Error("L'evento non esiste più.");
+    if (!response.ok) throw new Error(`calendar delete ${response.status}`);
+    return `Evento cancellato: ${title}.`;
   },
 };
 
@@ -3418,10 +3458,26 @@ type CalendarEventDraft = {
   confidence: number;
 };
 
+type CalendarMutationDraft = {
+  intent: "calendar_update" | "calendar_delete" | "unknown";
+  query: string | null;
+  search_start: string | null;
+  search_end: string | null;
+  title: string | null;
+  start_at: string | null;
+  end_at: string | null;
+  location: string | null;
+  description: string | null;
+  all_day: boolean;
+  confidence: number;
+};
+
 type GoogleCalendarEvent = {
   id?: string;
+  etag?: string;
   summary?: string;
   location?: string;
+  description?: string;
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
 };
@@ -3440,6 +3496,13 @@ function isCalendarIntent(text: string): boolean {
     || value.includes("aggiungi appuntamento")
     || value.includes("crea appuntamento")
     || value.includes("crea evento");
+}
+
+function isCalendarMutationIntent(text: string): boolean {
+  const value = normalizeForMatch(text);
+  const action = /\b(modifica|sposta|rinomina|cambia|aggiorna|cancella|elimina|rimuovi)\b/.test(value);
+  const subject = /\b(calendario|evento|appuntamento|impegno)\b/.test(value);
+  return action && subject;
 }
 
 function isCalendarReadIntent(text: string): boolean {
@@ -3463,7 +3526,9 @@ function isCalendarReadIntent(text: string): boolean {
 }
 
 async function gestisciCalendar(env: Env, chatId: number, text: string): Promise<CalendarReply | null> {
-  if (!isCalendarReadIntent(text) && !isCalendarIntent(text)) return null;
+  if (!isCalendarReadIntent(text) && !isCalendarIntent(text) && !isCalendarMutationIntent(text)) return null;
+
+  if (isCalendarMutationIntent(text)) return gestisciMutazioneCalendar(env, chatId, text);
 
   if (isCalendarReadIntent(text)) {
     const range = getCalendarReadRange(text, env.TIMEZONE || "Europe/Rome");
@@ -3490,6 +3555,71 @@ async function gestisciCalendar(env: Env, chatId: number, text: string): Promise
     text: `📅 Confermi?\nTitolo: ${draft.title}\nQuando: ${formatCalendarDate(startAt, draft.all_day)}${draft.location ? `\nLuogo: ${draft.location}` : ""}`,
     inlineKeyboard: [[{ text: "✅ Crea", callback_data: pending.approveData }, { text: "❌ Annulla", callback_data: pending.rejectData }]],
   };
+}
+
+async function gestisciMutazioneCalendar(env: Env, chatId: number, text: string): Promise<CalendarReply> {
+  const draft = await parseCalendarMutation(env, text);
+  if (draft.intent === "unknown" || draft.confidence < 0.65 || !draft.query || !draft.search_start || !draft.search_end) {
+    return { text: "Indicami evento e data, per esempio: cancella l'appuntamento con Luca di domani, oppure sposta l'evento Rossi del 12 settembre alle 18." };
+  }
+  const events = await listGoogleCalendarEvents(env, draft.search_start, draft.search_end);
+  if (events === null) return { text: "Non riesco a leggere Google Calendar in questo momento." };
+  const matches = findCalendarMatches(events, draft.query);
+  if (!matches.length) return { text: `Non trovo un evento che corrisponda a “${draft.query}” nel periodo indicato.` };
+  if (matches.length > 1) {
+    const choices = matches.slice(0, 5).map(event => `- ${formatCalendarDate(event.start?.dateTime || event.start?.date || "", Boolean(event.start?.date))} — ${event.summary || "Senza titolo"}`);
+    return { text: `Ho trovato più eventi. Dimmi quale vuoi ${draft.intent === "calendar_delete" ? "cancellare" : "modificare"}, aggiungendo titolo o orario:\n${choices.join("\n")}` };
+  }
+  const event = matches[0];
+  if (!event.id || !event.etag) return { text: "L'evento trovato non può essere modificato: manca il suo identificativo." };
+  const currentTitle = event.summary || "Senza titolo";
+  const currentStart = event.start?.dateTime || event.start?.date || "";
+
+  if (draft.intent === "calendar_delete") {
+    const pending = await createPendingAction(env, chatId, "calendar-delete", { eventId: event.id, etag: event.etag, title: currentTitle });
+    return {
+      text: `🗑️ Confermi la cancellazione?\nEvento: ${currentTitle}\nQuando: ${formatCalendarDate(currentStart, Boolean(event.start?.date))}`,
+      inlineKeyboard: [[{ text: "🗑️ Cancella", callback_data: pending.approveData }, { text: "❌ Annulla", callback_data: pending.rejectData }]],
+    };
+  }
+
+  const start = draft.start_at ? (draft.all_day ? draft.start_at.slice(0, 10) : draft.start_at) : null;
+  const previousStart = event.start?.dateTime || event.start?.date || "";
+  const previousEnd = event.end?.dateTime || event.end?.date || "";
+  const previousDurationMinutes = previousStart && previousEnd
+    ? Math.max(1, Math.round((Date.parse(previousEnd) - Date.parse(previousStart)) / 60_000))
+    : (draft.all_day ? 24 * 60 : 60);
+  const end = draft.end_at
+    ? (draft.all_day ? draft.end_at.slice(0, 10) : draft.end_at)
+    : (start ? (draft.all_day
+      ? addMinutesIso(`${start}T00:00:00Z`, previousDurationMinutes).slice(0, 10)
+      : addMinutesIso(start, previousDurationMinutes)) : null);
+  if (!draft.title && !start && !draft.location && !draft.description) return { text: "Dimmi cosa vuoi cambiare: titolo, data, ora, luogo o descrizione." };
+  const pending = await createPendingAction(env, chatId, "calendar-update", {
+    eventId: event.id, etag: event.etag, currentTitle,
+    title: draft.title, start, end, location: draft.location, description: draft.description,
+  });
+  const changes = [
+    draft.title ? `Nuovo titolo: ${draft.title}` : "",
+    start ? `Nuova data/ora: ${formatCalendarDate(start, draft.all_day)}` : "",
+    draft.location ? `Nuovo luogo: ${draft.location}` : "",
+    draft.description ? `Nuova descrizione: ${draft.description}` : "",
+  ].filter(Boolean);
+  return {
+    text: `✏️ Confermi la modifica?\nEvento: ${currentTitle}\n${changes.join("\n")}`,
+    inlineKeyboard: [[{ text: "✅ Modifica", callback_data: pending.approveData }, { text: "❌ Annulla", callback_data: pending.rejectData }]],
+  };
+}
+
+function findCalendarMatches(events: GoogleCalendarEvent[], query: string): GoogleCalendarEvent[] {
+  const wanted = normalizeForMatch(query);
+  const exact = events.filter(event => normalizeForMatch(event.summary || "") === wanted);
+  if (exact.length) return exact;
+  const terms = wanted.split(/\s+/).filter(term => term.length > 2);
+  return events.filter(event => {
+    const title = normalizeForMatch(event.summary || "");
+    return title.includes(wanted) || (terms.length > 0 && terms.every(term => title.includes(term)));
+  });
 }
 
 function getCalendarReadRange(text: string, timezone: string): { start: string; end: string; label: string } {
@@ -3649,6 +3779,45 @@ Rispondi SOLO JSON valido:
   } catch (error) {
     console.error("[GCAL] Parse evento fallito:", error);
     return { intent: "unknown", title: null, description: null, location: null, start_at: null, end_at: null, all_day: false, confidence: 0 };
+  }
+}
+
+async function parseCalendarMutation(env: Env, text: string): Promise<CalendarMutationDraft> {
+  const now = new Date();
+  const timezone = env.TIMEZONE || "Europe/Rome";
+  const defaultStart = new Date(now.getTime() - 30 * 86_400_000).toISOString();
+  const defaultEnd = new Date(now.getTime() + 366 * 86_400_000).toISOString();
+  const system = `Interpreta una richiesta italiana di modifica o cancellazione di un evento Google Calendar.
+Ora corrente: ${now.toISOString()}. Timezone: ${timezone}.
+Regole:
+- query è il testo distintivo del titolo dell'evento esistente, senza parole operative e senza data/orario
+- search_start/search_end delimitano il periodo in cui cercare l'evento esistente; per una data specifica usa l'intera giornata locale
+- se il periodo dell'evento esistente non è indicato usa ${defaultStart} e ${defaultEnd}
+- calendar_update: valorizza SOLO i nuovi valori esplicitamente richiesti; title non è il titolo attuale ma l'eventuale nuovo titolo
+- per uno spostamento, start_at è il nuovo inizio ed end_at la nuova fine; se manca la durata end_at può essere null
+- calendar_delete non deve valorizzare i campi di modifica
+- non inventare dati mancanti
+Rispondi SOLO JSON valido:
+{"intent":"calendar_update|calendar_delete|unknown","query":"string|null","search_start":"ISO datetime|null","search_end":"ISO datetime|null","title":"string|null","start_at":"ISO datetime|null","end_at":"ISO datetime|null","location":"string|null","description":"string|null","all_day":false,"confidence":0.0}`;
+  try {
+    const out = await askClaudeJSON(env, system, text);
+    const parsed = JSON.parse(cleanJson(out)) as Partial<CalendarMutationDraft>;
+    return {
+      intent: parsed.intent === "calendar_update" || parsed.intent === "calendar_delete" ? parsed.intent : "unknown",
+      query: typeof parsed.query === "string" ? parsed.query : null,
+      search_start: typeof parsed.search_start === "string" ? parsed.search_start : null,
+      search_end: typeof parsed.search_end === "string" ? parsed.search_end : null,
+      title: typeof parsed.title === "string" ? parsed.title : null,
+      start_at: typeof parsed.start_at === "string" ? parsed.start_at : null,
+      end_at: typeof parsed.end_at === "string" ? parsed.end_at : null,
+      location: typeof parsed.location === "string" ? parsed.location : null,
+      description: typeof parsed.description === "string" ? parsed.description : null,
+      all_day: Boolean(parsed.all_day),
+      confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0,
+    };
+  } catch (error) {
+    console.error("[GCAL] Parse modifica/cancellazione fallito:", error);
+    return { intent: "unknown", query: null, search_start: null, search_end: null, title: null, start_at: null, end_at: null, location: null, description: null, all_day: false, confidence: 0 };
   }
 }
 
