@@ -178,8 +178,13 @@ export default {
         return new Response("ok");
       }
       try {
-        const reply = await handlePendingActionCallback(env, callbackChatId, String(callbackQuery.data ?? ""));
-        await answerCallbackQuery(env, callbackQuery.id, reply);
+        const result = await handlePendingActionCallback(env, callbackChatId, String(callbackQuery.data ?? ""));
+        await answerCallbackQuery(env, callbackQuery.id, result.reply);
+        console.log("[CALLBACK] Risposta Telegram inviata:", { action: result.action, chatId: callbackChatId });
+        if (result.persistentMessage) {
+          await sendMessage(env, callbackChatId, result.persistentMessage);
+          console.log("[CALLBACK] Conferma persistente inviata:", { action: result.action, chatId: callbackChatId });
+        }
       } catch (error) {
         console.error("[FASE-3] Callback Telegram fallita:", error);
         await answerCallbackQuery(env, callbackQuery.id, "Azione non riuscita. Riprova.");
@@ -2441,32 +2446,38 @@ async function createPendingAction(
   return { id, approveData: `pending:approve:${id}`, rejectData: `pending:reject:${id}` };
 }
 
-async function handlePendingActionCallback(env: Env, chatId: number, callbackData: string): Promise<string> {
+type PendingCallbackResult = { reply: string; action: PendingActionType | null; persistentMessage?: string };
+
+async function handlePendingActionCallback(env: Env, chatId: number, callbackData: string): Promise<PendingCallbackResult> {
   const match = callbackData.match(/^pending:(approve|reject):([0-9a-f-]{36})$/i);
-  if (!match) return "Azione non riconosciuta.";
+  if (!match) return { reply: "Azione non riconosciuta.", action: null };
   const [, decision, id] = match;
   const raw = await env.SAVERIO_KV.get(pendingActionKey(id));
-  if (!raw) return "Questa proposta è scaduta o è già stata gestita.";
+  if (!raw) return { reply: "Questa proposta è scaduta o è già stata gestita.", action: null };
 
   let pending: PendingAction;
   try {
     pending = JSON.parse(raw) as PendingAction;
   } catch {
     await env.SAVERIO_KV.delete(pendingActionKey(id));
-    return "Proposta non leggibile.";
+    return { reply: "Proposta non leggibile.", action: null };
   }
   if (pending.chatId !== chatId || Date.parse(pending.expiresAt) <= Date.now()) {
     await env.SAVERIO_KV.delete(pendingActionKey(id));
-    return "Questa proposta è scaduta.";
+    return { reply: "Questa proposta è scaduta.", action: pending.action };
   }
   if (decision === "reject") {
     await env.SAVERIO_KV.delete(pendingActionKey(id));
-    return "Proposta rifiutata.";
+    return { reply: "Proposta rifiutata.", action: pending.action };
   }
 
   const reply = await executePendingAction(env, pending);
   await env.SAVERIO_KV.delete(pendingActionKey(id));
-  return reply;
+  return {
+    reply,
+    action: pending.action,
+    ...(pending.action === "calendar-create" ? { persistentMessage: `✅ ${reply}` } : {}),
+  };
 }
 
 async function executePendingAction(env: Env, pending: PendingAction): Promise<string> {
@@ -2556,7 +2567,7 @@ const PENDING_ACTION_HANDLERS: Record<PendingActionType, PendingActionHandler> =
     const body = asRecord(await response.json());
     const id = asString(body.id);
     if (!response.ok || !id) throw new Error(`calendar/create-event ${response.status}`);
-    return `Evento creato: ${title} (ID ${id}).`;
+    return `Evento creato: ${title}\n${formatCalendarDate(startAt, allDay)} (ID ${id}).`;
   },
 };
 
