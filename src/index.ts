@@ -193,7 +193,9 @@ export default {
         }
       } catch (error) {
         console.error("[FASE-3] Callback Telegram fallita:", error);
-        await answerCallbackQuery(env, callbackQuery.id, "Azione non riuscita. Riprova.");
+        const message = error instanceof Error ? error.message : "Azione non riuscita. Riprova.";
+        await answerCallbackQuery(env, callbackQuery.id, message.slice(0, 180));
+        await sendMessage(env, callbackChatId, `Azione non riuscita: ${message}`);
       }
       return new Response("ok");
     }
@@ -229,6 +231,12 @@ export default {
       }
     }
     if (!text) return new Response("ok");
+
+    const pendingTextReply = await handlePendingActionText(env, chatId, text);
+    if (pendingTextReply) {
+      await sendMessage(env, chatId, pendingTextReply);
+      return new Response("ok");
+    }
 
     const regularizeReply = await handleRegularizeInput(env, chatId, text);
     if (regularizeReply) {
@@ -589,6 +597,7 @@ const deepDiveQueueKey = (createdAt: string, id: string) => `queue:deep-dive:${c
 const DEEP_DIVE_PENDING_FLAG_KEY = "has-pending-jobs";
 const deepDiveInputKey = (chatId: number) => `pending_indaga:${chatId}`;
 const pendingActionKey = (id: string) => `pending:${id}`;
+const latestPendingActionKey = (chatId: number) => `pending-latest:${chatId}`;
 
 function getDeepDiveTarget(text: string): string | null {
   const match = text.match(/^\/indaga(?:@\w+)?(?:\s+([\s\S]+))?$/i);
@@ -2449,6 +2458,7 @@ async function createPendingAction(
     expiresAt: new Date(Date.now() + PENDING_ACTION_TTL * 1000).toISOString(),
   };
   await env.SAVERIO_KV.put(pendingActionKey(id), JSON.stringify(pending), { expirationTtl: PENDING_ACTION_TTL });
+  await env.SAVERIO_KV.put(latestPendingActionKey(chatId), id, { expirationTtl: PENDING_ACTION_TTL });
   return { id, approveData: `pending:approve:${id}`, rejectData: `pending:reject:${id}` };
 }
 
@@ -2474,16 +2484,40 @@ async function handlePendingActionCallback(env: Env, chatId: number, callbackDat
   }
   if (decision === "reject") {
     await env.SAVERIO_KV.delete(pendingActionKey(id));
+    await clearLatestPendingAction(env, chatId, id);
     return { reply: "Proposta rifiutata.", action: pending.action };
   }
 
   const reply = await executePendingAction(env, pending);
   await env.SAVERIO_KV.delete(pendingActionKey(id));
+  await clearLatestPendingAction(env, chatId, id);
   return {
     reply,
     action: pending.action,
     ...(pending.action.startsWith("calendar-") ? { persistentMessage: `✅ ${reply}` } : {}),
   };
+}
+
+async function clearLatestPendingAction(env: Env, chatId: number, id: string): Promise<void> {
+  const key = latestPendingActionKey(chatId);
+  if (await env.SAVERIO_KV.get(key) === id) await env.SAVERIO_KV.delete(key);
+}
+
+async function handlePendingActionText(env: Env, chatId: number, text: string): Promise<string | null> {
+  const value = normalizeForMatch(text).replace(/[.!?]+$/g, "").trim();
+  const approve = /^(si|si confermo|confermo|va bene|ok confermo)$/.test(value);
+  const reject = /^(no|no annulla|annulla|lascia stare|non confermo)$/.test(value);
+  if (!approve && !reject) return null;
+
+  const id = await env.SAVERIO_KV.get(latestPendingActionKey(chatId));
+  if (!id) return null;
+  try {
+    const result = await handlePendingActionCallback(env, chatId, `pending:${approve ? "approve" : "reject"}:${id}`);
+    return result.persistentMessage ?? result.reply;
+  } catch (error) {
+    console.error("[PENDING] Conferma testuale fallita:", error);
+    return error instanceof Error ? `Azione non riuscita: ${error.message}` : "Azione non riuscita. Riprova.";
+  }
 }
 
 async function executePendingAction(env: Env, pending: PendingAction): Promise<string> {
@@ -2606,12 +2640,19 @@ const PENDING_ACTION_HANDLERS: Record<PendingActionType, PendingActionHandler> =
     const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + `/calendar/events/${encodeURIComponent(eventId)}`;
     const response = await fetch(endpoint, {
       method: "DELETE",
-      headers: { "content-type": "application/json", "x-agent-key": env.AGENT_KEY },
-      body: JSON.stringify({ etag }),
+      headers: { "x-agent-key": env.AGENT_KEY, "if-match": etag },
     });
     if (response.status === 409) throw new Error("L'evento è cambiato nel frattempo: rileggilo e riprova.");
     if (response.status === 404) throw new Error("L'evento non esiste più.");
-    if (!response.ok) throw new Error(`calendar delete ${response.status}`);
+    if (!response.ok) {
+      const raw = await response.text();
+      let detail = raw.slice(0, 160);
+      try {
+        const body = JSON.parse(raw) as unknown;
+        detail = asString(asRecord(body).error) ?? detail;
+      } catch { /* risposta non JSON */ }
+      throw new Error(`Calendar delete ${response.status}${detail ? `: ${detail}` : ""}`);
+    }
     return `Evento cancellato: ${title}.`;
   },
 };
@@ -3487,8 +3528,11 @@ function isCalendarIntent(text: string): boolean {
   const value = normalizeForMatch(text);
   return value.startsWith("appuntamento ")
     || value.startsWith("appuntamento:")
+    || value.startsWith("un appuntamento ")
+    || value.startsWith("un appuntamento:")
     || value.startsWith("calendario ")
     || value.startsWith("calendario:")
+    || /\b(?:crea|creare|aggiungi|aggiungere|fissa|fissare|inserisci|inserire)\s+(?:un\s+)?(?:evento|appuntamento|impegno)\b/.test(value)
     || value.includes("metti in calendario")
     || value.includes("segna in calendario")
     || value.includes("segna un appuntamento")
@@ -3756,6 +3800,9 @@ Oggi/ora corrente: ${now}
 Timezone obbligatoria: ${timezone}
 Regole:
 - per calendar_create, start_at/end_at sono la data dell'evento da creare
+- title deve contenere sia la persona/oggetto sia lo scopo esplicitamente detto dall'utente
+- frasi come "appuntamento con Serena Palumbo, devo mandarle una email" indicano un solo evento: usa come title "Appuntamento con Serena Palumbo per mandare email"
+- la presenza delle parole email, chiamare, telefonare o scrivere dentro una richiesta di appuntamento descrive lo scopo dell'evento e non cambia l'intento
 - se manca durata, end_at = start_at + 60 minuti
 - se l'utente dice "tutto il giorno", all_day=true
 - se manca orario ma dice mattina=09:00, pomeriggio=16:00, sera=20:00
