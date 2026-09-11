@@ -5276,16 +5276,44 @@ function noteDeletionQuery(text: string): string | null {
   return match?.[1]?.trim() || null;
 }
 
+const recentBlocNotesCaptureKey = (chatId: number) => `recent_blocnotes_capture:${chatId}`;
+
+type RecentBlocNotesCapture = { noteId: string; title: string; fact: string };
+
+function matchesNoteText(query: string, text: string): boolean {
+  const terms = normalizeForMatch(query).split(" ").filter(term => term.length > 2);
+  const haystack = normalizeForMatch(text);
+  return terms.length > 0 && terms.every(term => haystack.includes(term));
+}
+
+async function loadRecentBlocNotesCapture(env: Env, chatId: number): Promise<RecentBlocNotesCapture | null> {
+  const raw = await env.SAVERIO_KV.get(recentBlocNotesCaptureKey(chatId));
+  try {
+    const value = asRecord(raw ? JSON.parse(raw) : null);
+    const noteId = asString(value.noteId); const title = asString(value.title); const fact = asString(value.fact);
+    return noteId && title && fact ? { noteId, title, fact } : null;
+  } catch { return null; }
+}
+
 async function gestisciNotaBlocNotes(env: Env, chatId: number, messageId: number, text: string): Promise<CalendarReply | null> {
   const deleteQuery = noteDeletionQuery(text);
   if (deleteQuery) {
     try {
+      const recent = await loadRecentBlocNotesCapture(env, chatId);
+      if (recent && matchesNoteText(deleteQuery, recent.fact)) {
+        const pending = await createPendingAction(env, chatId, "note-delete", { noteId: recent.noteId, title: recent.title });
+        return {
+          text: `Confermi la cancellazione su BlocNotes?\nNota: ${recent.title}\n\nFinchÃ© non confermi, non cancello nulla.`,
+          inlineKeyboard: [[{ text: "Cancella nota", callback_data: pending.approveData }, { text: "Annulla", callback_data: pending.rejectData }]],
+        };
+      }
       const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + "/sources/blocnotes/search";
       const url = new URL(endpoint);
       url.searchParams.set("q", deleteQuery);
       const response = await fetch(url.toString(), { headers: { "x-agent-key": env.AGENT_KEY } });
       const body = asRecord(await response.json().catch(() => null));
-      const matches = Array.isArray(body.matches) ? body.matches.filter(isRecord) : [];
+      const matches = (Array.isArray(body.matches) ? body.matches.filter(isRecord) : [])
+        .filter(match => matchesNoteText(deleteQuery, `${asString(match.title) ?? ""} ${asString(match.excerpt) ?? ""}`));
       if (!response.ok) return { text: "Non riesco a cercare la nota su BlocNotes: non ho cancellato nulla." };
       if (!matches.length) return { text: "Non trovo una nota BlocNotes che corrisponda. Non ho cancellato nulla." };
       if (matches.length > 1) {
@@ -5322,6 +5350,8 @@ async function gestisciNotaBlocNotes(env: Env, chatId: number, messageId: number
       return { text: "Non sono riuscito a salvarla su BlocNotes. Non la considero registrata: riprova tra poco." };
     }
     const title = asString(body.title) ?? "Nota Telegram";
+    const noteId = asString(body.noteId);
+    if (noteId) await env.SAVERIO_KV.put(recentBlocNotesCaptureKey(chatId), JSON.stringify({ noteId, title, fact }), { expirationTtl: 24 * 60 * 60 });
     return { text: `Salvato e verificato su BlocNotes: ${title}.` };
   } catch (error) {
     console.error("[BLOCNOTES] errore salvataggio nota", { chatId, messageId, error: error instanceof Error ? error.message : String(error) });
