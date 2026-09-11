@@ -5307,7 +5307,9 @@ async function gestisciNotaBlocNotes(env: Env, chatId: number, messageId: number
           inlineKeyboard: [[{ text: "Cancella nota", callback_data: pending.approveData }, { text: "Annulla", callback_data: pending.rejectData }]],
         };
       }
-      const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + "/sources/blocnotes/search";
+      // Per una cancellazione non usiamo indice o ricerca semantica: leggiamo
+      // direttamente BlocNotes e richiediamo che ogni parola distintiva sia presente.
+      const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + "/notes/find-exact";
       const url = new URL(endpoint);
       url.searchParams.set("q", deleteQuery);
       const response = await fetch(url.toString(), { headers: { "x-agent-key": env.AGENT_KEY } });
