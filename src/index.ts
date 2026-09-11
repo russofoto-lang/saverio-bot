@@ -4704,10 +4704,24 @@ async function sintetizzaDecisione(env: Env, history: Turn[]): Promise<{ testo: 
     .join("\n");
 
   const sys = `Sintetizza in UNA frase densa la decisione presa o l'andamento descritto negli ultimi scambi, includendo il "perché" se c'è. Non inventare dettagli non detti. Se c'è un cliente/progetto citato, estrailo separatamente.
-Rispondi SOLO JSON: {"testo": "...", "cliente": "nome o null"}`;
+  Rispondi SOLO JSON: {"testo": "...", "cliente": "nome o null"}`;
 
   const out = await askClaudeJSON(env, sys, recenti);
-  return JSON.parse(out.replace(/```json|```/g, "").trim());
+  const parsed = parseJsonRecord(out);
+  const testo = asString(parsed?.testo)?.trim();
+  const cliente = asString(parsed?.cliente)?.trim();
+  if (testo) {
+    return {
+      testo: testo.slice(0, 1_000),
+      cliente: cliente && cliente.toLowerCase() !== "null" ? cliente.slice(0, 200) : null,
+    };
+  }
+
+  // Un output strutturato malformato non deve impedire a Telegram di
+  // ricevere 200 né trasformarsi in una scrittura automatica: riproponiamo
+  // il testo dell'utente e attendiamo sempre la sua conferma esplicita.
+  const ultimoMessaggioUtente = [...history].reverse().find((turn) => turn.role === "user")?.content.trim();
+  return { testo: ultimoMessaggioUtente?.slice(0, 1_000) || "Promemoria da precisare", cliente: null };
 }
 
 async function gestisciSegna(env: Env, chatId: number, history: Turn[]): Promise<string> {
