@@ -1,4 +1,11 @@
 // Saverio — socio senior. Cloudflare Worker.
+import {
+  applyMeaningRules,
+  parseLearningCommand,
+  type LearnedRule,
+  type LearningRuleDraft,
+} from "./chat-learning.mts";
+
 // Riceve webhook Telegram, chiama Claude (con web search), risponde su Telegram.
 // La memoria conversazionale vive in KV con scadenza automatica.
 
@@ -37,6 +44,7 @@ const MAX_HISTORY = 30;            // ultimi N messaggi tenuti nel filo
 const HISTORY_TTL = 60 * 60 * 24 * 14; // la conversazione in corso scade dopo 14 giorni
 const MAX_LONG_MEMORIES = 120;      // ricordi stabili, decisioni e fatti importanti
 const MAX_RELEVANT_MEMORIES = 12;   // quanti ricordi passare al modello a ogni risposta
+const MAX_LEARNED_RULES = 50;
 const OWNER_CHAT_ID = 556479855;
 const FIRESTORE_PROJECT_ID = "bloc-notes-mariano";
 const FIRESTORE_SCOPE = "https://www.googleapis.com/auth/datastore";
@@ -238,6 +246,21 @@ export default {
       await sendMessage(env, chatId, pendingTextReply);
       return new Response("ok");
     }
+
+    const learningReply = await gestisciApprendimentoChat(env, chatId, text);
+    if (learningReply) {
+      await appendHistory(env, chatId, [
+        { role: "user", content: text },
+        { role: "assistant", content: learningReply.text },
+      ]);
+      await sendMessage(env, chatId, learningReply.text, learningReply.inlineKeyboard ? { inlineKeyboard: learningReply.inlineKeyboard } : undefined);
+      return new Response("ok");
+    }
+
+    // I significati personalizzati sono applicati solo dopo essere stati
+    // confermati e prima del routing operativo.
+    const learnedRules = await loadLearnedRules(env, chatId);
+    text = applyMeaningRules(text, learnedRules);
 
     const regularizeReply = await handleRegularizeInput(env, chatId, text);
     if (regularizeReply) {
@@ -575,7 +598,7 @@ type DeepDiveJob = {
   error: string | null;
 };
 type TelegramInlineButton = { text: string; callback_data: string };
-type PendingActionType = "task-open" | "skill-merge" | "skill-quarantine" | "arretrati-log-event" | "arretrati-suspend" | "arretrati-retry" | "arretrati-audit-tag" | "calendar-create" | "calendar-update" | "calendar-delete";
+type PendingActionType = "task-open" | "skill-merge" | "skill-quarantine" | "learning-rule-add" | "learning-rule-delete" | "arretrati-log-event" | "arretrati-suspend" | "arretrati-retry" | "arretrati-audit-tag" | "calendar-create" | "calendar-update" | "calendar-delete";
 type PendingAction = {
   action: PendingActionType;
   params: JsonValue;
@@ -593,6 +616,7 @@ type LongMemory = {
 
 const historyKey = (chatId: number) => `hist:${chatId}`;
 const longMemoryKey = (chatId: number) => `long_memory:${chatId}`;
+const learnedRulesKey = (chatId: number) => `learned_rules:${chatId}`;
 const deepDiveJobKey = (id: string) => `job:${id}`;
 const deepDiveQueueKey = (createdAt: string, id: string) => `queue:deep-dive:${createdAt}:${id}`;
 const DEEP_DIVE_PENDING_FLAG_KEY = "has-pending-jobs";
@@ -2306,6 +2330,71 @@ async function saveLongMemories(env: Env, chatId: number, memories: LongMemory[]
   await env.SAVERIO_KV.put(longMemoryKey(chatId), JSON.stringify(trimmed));
 }
 
+async function loadLearnedRules(env: Env, chatId: number): Promise<LearnedRule[]> {
+  const raw = await env.SAVERIO_KV.get(learnedRulesKey(chatId));
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is LearnedRule => {
+      const rule = asRecord(item);
+      const scope = asString(rule.scope);
+      return Boolean(asString(rule.id)
+        && asString(rule.createdAt)
+        && asString(rule.trigger)
+        && asString(rule.instruction)
+        && (scope === "calendar_classification" || scope === "meaning" || scope === "behavior"));
+    }).slice(-MAX_LEARNED_RULES);
+  } catch {
+    return [];
+  }
+}
+
+async function saveLearnedRules(env: Env, chatId: number, rules: LearnedRule[]): Promise<void> {
+  await env.SAVERIO_KV.put(learnedRulesKey(chatId), JSON.stringify(rules.slice(-MAX_LEARNED_RULES)));
+}
+
+async function addLearnedRule(env: Env, chatId: number, draft: LearningRuleDraft): Promise<LearnedRule> {
+  const rules = await loadLearnedRules(env, chatId);
+  const normalizedInstruction = normalizeForMatch(draft.instruction);
+  const existing = rules.find((rule) => normalizeForMatch(rule.instruction) === normalizedInstruction);
+  if (existing) return existing;
+  const rule: LearnedRule = { ...draft, id: crypto.randomUUID(), createdAt: new Date().toISOString() };
+  rules.push(rule);
+  await saveLearnedRules(env, chatId, rules);
+  return rule;
+}
+
+async function deleteLearnedRule(env: Env, chatId: number, id: string): Promise<boolean> {
+  const rules = await loadLearnedRules(env, chatId);
+  const remaining = rules.filter((rule) => rule.id !== id);
+  if (remaining.length === rules.length) return false;
+  await saveLearnedRules(env, chatId, remaining);
+  return true;
+}
+
+function formatLearnedRules(rules: LearnedRule[]): string {
+  if (!rules.length) return "Non ho ancora regole imparate e confermate.";
+  return `Regole imparate:\n${rules.map((rule, index) => `${index + 1}. ${rule.instruction}`).join("\n")}\n\nPer eliminarne una: \"dimentica la regola 2\".`;
+}
+
+async function gestisciApprendimentoChat(env: Env, chatId: number, text: string): Promise<CalendarReply | null> {
+  const command = parseLearningCommand(text);
+  if (command.kind === "none") return null;
+  const rules = await loadLearnedRules(env, chatId);
+  if (command.kind === "list") return { text: formatLearnedRules(rules) };
+  if (command.kind === "delete") {
+    const rule = rules[command.index - 1];
+    if (!rule) return { text: `Non esiste la regola ${command.index}. Scrivi \"cosa hai imparato?\" per vedere l'elenco.` };
+    const pending = await createPendingAction(env, chatId, "learning-rule-delete", { chatId, ruleId: rule.id, instruction: rule.instruction });
+    return { text: `Vuoi davvero dimenticare questa regola?\n${rule.instruction}`, inlineKeyboard: [[{ text: "Dimentica", callback_data: pending.approveData }, { text: "Annulla", callback_data: pending.rejectData }]] };
+  }
+  const duplicate = rules.some((rule) => normalizeForMatch(rule.instruction) === normalizeForMatch(command.draft.instruction));
+  if (duplicate) return { text: `Questa regola è già stata imparata:\n${command.draft.instruction}` };
+  const pending = await createPendingAction(env, chatId, "learning-rule-add", { chatId, ...command.draft });
+  return { text: `Ho capito questa correzione:\n${command.draft.instruction}\n\nVuoi renderla una regola permanente?`, inlineKeyboard: [[{ text: "Impara", callback_data: pending.approveData }, { text: "Solo questa volta", callback_data: pending.rejectData }]] };
+}
+
 async function addLongMemory(
   env: Env,
   chatId: number,
@@ -2328,8 +2417,18 @@ async function addLongMemory(
 }
 
 async function loadRelevantMemories(env: Env, chatId: number, text: string): Promise<LongMemory[]> {
-  const memories = await loadLongMemories(env, chatId);
-  if (!memories.length) return [];
+  const [memories, learnedRules] = await Promise.all([
+    loadLongMemories(env, chatId),
+    loadLearnedRules(env, chatId),
+  ]);
+  const ruleMemories: LongMemory[] = learnedRules.slice(-20).map((rule) => ({
+    id: `learned-rule:${rule.id}`,
+    testo: `REGOLA CONFERMATA: ${rule.instruction}`,
+    cliente: null,
+    createdAt: Date.parse(rule.createdAt) || Date.now(),
+    source: "learned-rule",
+  }));
+  if (!memories.length) return ruleMemories;
 
   const queryWords = keywordSet(text);
   const scored = memories.map((memory, index) => {
@@ -2347,9 +2446,10 @@ async function loadRelevantMemories(env: Env, chatId: number, text: string): Pro
     .map(item => item.memory)
     .slice(0, MAX_RELEVANT_MEMORIES);
 
-  return relevant.length
+  const ordinary = relevant.length
     ? relevant
     : memories.slice(-Math.min(5, MAX_RELEVANT_MEMORIES));
+  return [...ruleMemories, ...ordinary].slice(-(20 + MAX_RELEVANT_MEMORIES));
 }
 
 function buildSystemPrompt(memories: LongMemory[]): string {
@@ -2558,6 +2658,37 @@ const PENDING_ACTION_HANDLERS: Record<PendingActionType, PendingActionHandler> =
     });
     if (!response.ok) throw new Error(`task/open ${response.status}`);
     return "Task aperto.";
+  },
+  "learning-rule-add": async (env, params) => {
+    const chatId = asNumber(params.chatId);
+    const scope = asString(params.scope);
+    const trigger = asString(params.trigger);
+    const instruction = asString(params.instruction);
+    if (chatId === null || !trigger || !instruction
+      || (scope !== "calendar_classification" && scope !== "meaning" && scope !== "behavior")) {
+      throw new Error("regola di apprendimento non valida");
+    }
+    const effectValue = asString(params.effect);
+    const replacement = asString(params.replacement) ?? undefined;
+    const draft: LearningRuleDraft = {
+      scope,
+      trigger,
+      instruction,
+      ...(effectValue === "work" || effectValue === "personal" ? { effect: effectValue } : {}),
+      ...(replacement ? { replacement } : {}),
+    };
+    if (scope === "calendar_classification" && !draft.effect) throw new Error("classificazione Calendar incompleta");
+    if (scope === "meaning" && !draft.replacement) throw new Error("significato personalizzato incompleto");
+    const rule = await addLearnedRule(env, chatId, draft);
+    return `Regola imparata e verificata:\n${rule.instruction}\nID regola: ${rule.id}`;
+  },
+  "learning-rule-delete": async (env, params) => {
+    const chatId = asNumber(params.chatId);
+    const ruleId = asString(params.ruleId);
+    const instruction = asString(params.instruction) ?? "Regola";
+    if (chatId === null || !ruleId) throw new Error("cancellazione regola non valida");
+    if (!await deleteLearnedRule(env, chatId, ruleId)) throw new Error("regola non trovata");
+    return `Regola dimenticata e verificata:\n${instruction}`;
   },
   "skill-merge": async (env, params) => {
     const lessonIds = Array.isArray(params.lessonIds) ? params.lessonIds.filter((id): id is string => typeof id === "string") : [];
