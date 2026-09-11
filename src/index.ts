@@ -10,6 +10,7 @@ import { classifyCalendarEventTitle, planCalendarRead, type CalendarReadRange } 
 import { isCheckinNo, isCheckinYes, isDirectCheckinIntent, parseCheckinOutcomes, parseRescheduleInstruction } from "./daily-checkin.mts";
 import { analyzeAgenda, type AgendaRealisticEvent } from "./agenda-realistica.mts";
 import { extractNoteCapture } from "./note-capture.mts";
+import { isCalendarCreateIntent } from "./calendar-create-intent.mts";
 
 // Riceve webhook Telegram, chiama Claude (con web search), risponde su Telegram.
 // La memoria conversazionale vive in KV con scadenza automatica.
@@ -423,9 +424,9 @@ export default {
     if (reminderReply) {
       await appendHistory(env, chatId, [
         { role: "user", content: text },
-        { role: "assistant", content: reminderReply },
+        { role: "assistant", content: reminderReply.text },
       ]);
-      await sendMessage(env, chatId, reminderReply);
+      await sendMessage(env, chatId, reminderReply.text, reminderReply.inlineKeyboard ? { inlineKeyboard: reminderReply.inlineKeyboard } : undefined);
       return new Response("ok");
     }
 
@@ -2654,7 +2655,7 @@ async function clearLatestPendingAction(env: Env, chatId: number, id: string): P
 
 async function handlePendingActionText(env: Env, chatId: number, text: string): Promise<string | null> {
   const value = normalizeForMatch(text).replace(/[.!?]+$/g, "").trim();
-  const approve = /^(si|si confermo|confermo|va bene|ok confermo)$/.test(value);
+  const approve = /^(si|si confermo|confermo|va bene|ok confermo|aggiungi|crea)$/.test(value);
   const reject = /^(no|no annulla|annulla|lascia stare|non confermo)$/.test(value);
   if (!approve && !reject) return null;
 
@@ -3248,15 +3249,15 @@ async function listFutureReminders(env: Env, chatId: number): Promise<string> {
   }
 }
 
-async function gestisciPromemoria(env: Env, chatId: number, text: string): Promise<string | null> {
+async function gestisciPromemoria(env: Env, chatId: number, text: string): Promise<CalendarReply | null> {
   if (!isReminderIntent(text)) return null;
   if (!env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-    return "I promemoria non sono ancora configurati: manca l'accesso Firestore di Saverio.";
+    return { text: "I promemoria non sono ancora configurati: manca l'accesso Firestore di Saverio." };
   }
 
   const parsed = parseSingleReminder(text);
   if (!parsed) {
-    return "Dimmi anche quando devo ricordartelo. Per esempio: segna un promemoria tra un'ora di mandare una email.";
+    return { text: "Dimmi anche quando devo ricordartelo. Per esempio: segna un promemoria tra un'ora di mandare una email." };
   }
 
   try {
@@ -3266,10 +3267,21 @@ async function gestisciPromemoria(env: Env, chatId: number, text: string): Promi
       due_at: parsed.dueAt,
       status: "pending",
     });
-    return `Promemoria impostato:\n${formatReminderDate(parsed.dueAt, env.TIMEZONE || "Europe/Rome")}\n${parsed.title}`;
+    const calendarTitle = `Promemoria: ${parsed.title}`;
+    const pending = await createPendingAction(env, chatId, "calendar-create", {
+      title: calendarTitle,
+      startAt: parsed.dueAt,
+      endAt: addMinutesIso(parsed.dueAt, 15),
+      allDay: false,
+      description: "Promemoria Telegram",
+    });
+    return {
+      text: `Promemoria Telegram impostato:\n${formatReminderDate(parsed.dueAt, env.TIMEZONE || "Europe/Rome")}\n${parsed.title}\n\nConfermi anche l'evento in Google Calendar?\nTitolo: ${calendarTitle}`,
+      inlineKeyboard: [[{ text: "✅ Crea in Calendar", callback_data: pending.approveData }, { text: "❌ Solo promemoria", callback_data: pending.rejectData }]],
+    };
   } catch (error) {
     console.error("[REMINDER] Salvataggio fallito:", error);
-    return "Non sono riuscito a salvare il promemoria. Riprova tra poco.";
+    return { text: "Non sono riuscito a salvare il promemoria. Riprova tra poco." };
   }
 }
 
@@ -3866,24 +3878,6 @@ async function gestisciAgendaRealistica(env: Env, chatId: number, text: string):
   return { text: lines.join("\n") };
 }
 
-function isCalendarIntent(text: string): boolean {
-  const value = normalizeForMatch(text);
-  return value.startsWith("appuntamento ")
-    || value.startsWith("appuntamento:")
-    || value.startsWith("un appuntamento ")
-    || value.startsWith("un appuntamento:")
-    || value.startsWith("calendario ")
-    || value.startsWith("calendario:")
-    || /\b(?:crea|creare|aggiungi|aggiungere|fissa|fissare|inserisci|inserire)\s+(?:un\s+)?(?:evento|appuntamento|impegno)\b/.test(value)
-    || value.includes("metti in calendario")
-    || value.includes("segna in calendario")
-    || value.includes("segna un appuntamento")
-    || value.includes("segna appuntamento")
-    || value.includes("aggiungi appuntamento")
-    || value.includes("crea appuntamento")
-    || value.includes("crea evento");
-}
-
 function isCalendarMutationIntent(text: string): boolean {
   const value = normalizeForMatch(text);
   const action = /\b(modifica|sposta|rinomina|cambia|aggiorna|cancella|elimina|rimuovi)\b/.test(value);
@@ -3929,7 +3923,7 @@ async function gestisciCalendar(env: Env, chatId: number, text: string): Promise
     });
     return { text: sections.join("\n\n") };
   }
-  if (!isCalendarReadIntent(text) && !isCalendarIntent(text) && !isCalendarMutationIntent(text)) return null;
+  if (!isCalendarReadIntent(text) && !isCalendarCreateIntent(text) && !isCalendarMutationIntent(text)) return null;
 
   if (isCalendarMutationIntent(text)) return gestisciMutazioneCalendar(env, chatId, text);
 
