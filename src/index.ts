@@ -31,7 +31,8 @@ interface Env {
 // Lo trovi scrivendo a @userinfobot, oppure lo logghi alla prima esecuzione.
 const ALLOWED_USER_ID = 556479855; // <-- METTI IL TUO ID. 0 = nessun filtro (solo per il primo test)
 
-const MODEL = "claude-sonnet-4-6"; // per ragionare di più: "claude-opus-4-8"
+const MODEL = "claude-sonnet-4-6"; // mantenuto solo per ripristino futuro.
+const GEMINI_CHAT_MODEL = "gemini-3.5-flash";
 const MAX_HISTORY = 30;            // ultimi N messaggi tenuti nel filo
 const HISTORY_TTL = 60 * 60 * 24 * 14; // la conversazione in corso scade dopo 14 giorni
 const MAX_LONG_MEMORIES = 120;      // ricordi stabili, decisioni e fatti importanti
@@ -2416,32 +2417,52 @@ async function askClaude(
   memories: LongMemory[],
   reads: SavedRead[] = [],
 ): Promise<string> {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
+  return askGeminiText(
+    env,
+    `${buildSystemPromptWithReads(memories, reads)}\n\nConcludi sempre la risposta con una frase completa. Non iniziare un nuovo elenco o una nuova frase se non puoi terminarla.`,
+    history,
+    2048,
+  );
+}
+
+async function askGeminiText(
+  env: Env,
+  system: string,
+  turns: Turn[],
+  maxOutputTokens: number,
+  json = false,
+): Promise<string> {
+  if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY mancante");
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_CHAT_MODEL}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents: turns.map((turn) => ({
+          role: turn.role === "assistant" ? "model" : "user",
+          parts: [{ text: turn.content }],
+        })),
+        generationConfig: {
+          maxOutputTokens,
+          thinkingLevel: json ? "minimal" : "low",
+          ...(json ? { responseMimeType: "application/json" } : {}),
+        },
+      }),
     },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: 1500,
-      system: buildSystemPromptWithReads(memories, reads),
-      messages: history,
-      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 4 }],
-    }),
+  );
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`Gemini ${response.status}: ${raw.slice(0, 1000)}`);
+  const data = asRecord(JSON.parse(raw));
+  const candidates = Array.isArray(data.candidates) ? data.candidates.filter(isRecord) : [];
+  const parts = candidates.flatMap((candidate) => {
+    const content = asRecord(candidate.content);
+    return Array.isArray(content.parts) ? content.parts.filter(isRecord) : [];
   });
-
-  const raw = await res.text();
-
-  if (!res.ok) throw new Error(`anthropic ${res.status}: ${raw}`);
-  const data = JSON.parse(raw);
-
-  return data.content
-    .filter((b: any) => b.type === "text")
-    .map((b: any) => b.text)
-    .join("\n")
-    .trim() || "(nessuna risposta)";
+  const text = parts.map((part) => asString(part.text) ?? "").filter(Boolean).join("\n").trim();
+  if (!text) throw new Error("Gemini senza testo nella risposta");
+  return text;
 }
 async function createPendingAction(
   env: Env,
@@ -4548,25 +4569,7 @@ function intentGate(msg: string): "open" | "list" | "search" | "maybe_close" | n
 }
 
 async function askClaudeJSON(env: Env, system: string, user: string): Promise<string> {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: 300,
-      system,
-      messages: [{ role: "user", content: user }],
-    }),
-  });
-  const raw = await res.text();
-  if (!res.ok) throw new Error(`anthropic ${res.status}: ${raw}`);
-  const data = JSON.parse(raw);
-  if (!data.content) throw new Error(`anthropic risposta senza content: ${raw}`);
-  return data.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("").trim();
+  return askGeminiText(env, system, [{ role: "user", content: user }], 600, true);
 }
 
 async function estraiTask(env: Env, msg: string): Promise<any> {
