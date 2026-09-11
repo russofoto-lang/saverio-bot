@@ -3970,8 +3970,7 @@ async function gestisciCalendar(env: Env, chatId: number, text: string): Promise
   // qualunque richiesta possa ricadere nella vecchia catena sottostante.
   return null;
 
-  /* Legacy router removed from execution; retained as a comment until its
-     dead helper functions are removed in the same cleanup commit. */
+  /*
   if (!isCalendarReadIntent(text) && !isCalendarCreateIntent(text) && !isCalendarMutationIntent(text)) return null;
 
   if (isCalendarMutationIntent(text)) return gestisciMutazioneCalendar(env, chatId, text);
@@ -4011,6 +4010,7 @@ async function gestisciCalendar(env: Env, chatId: number, text: string): Promise
     text: `📅 Confermi?\nTitolo: ${draft.title}\nQuando: ${formatCalendarDate(startAt, draft.all_day)}${draft.location ? `\nLuogo: ${draft.location}` : ""}`,
     inlineKeyboard: [[{ text: "✅ Crea", callback_data: pending.approveData }, { text: "❌ Annulla", callback_data: pending.rejectData }]],
   };
+  */
 }
 
 async function gestisciCreazioneCalendar(env: Env, chatId: number, text: string): Promise<CalendarReply> {
