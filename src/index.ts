@@ -4198,6 +4198,21 @@ function formatGoogleCalendarEvents(events: GoogleCalendarEvent[], label: string
   return `Calendario ${label}:\n${lines.join("\n")}${more}`;
 }
 
+function parseDeterministicCalendarEvent(text: string, timezone: string): CalendarEventDraft | null {
+  const dayMatch = /\b(oggi|domani|dopodomani)\b/i.exec(text);
+  const timeMatch = /\balle\s+([01]?\d|2[0-3])(?:[.:,]([0-5]\d))?\b/i.exec(text);
+  if (!dayMatch || !timeMatch || timeMatch.index === undefined) return null;
+  const dayOffset = dayMatch[1].toLowerCase() === "oggi" ? 0 : dayMatch[1].toLowerCase() === "domani" ? 1 : 2;
+  const today = getRomeDateParts(new Date(), timezone);
+  const date = new Date(Date.UTC(today.year, today.month - 1, today.day + dayOffset));
+  const hour = Number(timeMatch[1]);
+  const minute = Number(timeMatch[2] || 0);
+  const title = text.slice(timeMatch.index + timeMatch[0].length).replace(/^\s*(?:per\s+)?/i, "").trim().replace(/[.?!]+$/, "");
+  if (!title) return null;
+  const startAt = toRomeDateTimeIso(date, hour, minute, timezone);
+  return { intent: "calendar_create", title, description: null, location: null, start_at: startAt, end_at: addMinutesIso(startAt, 60), all_day: false, confidence: 1 };
+}
+
 async function parseCalendarEvent(env: Env, text: string): Promise<CalendarEventDraft> {
   const now = new Date().toISOString();
   const timezone = env.TIMEZONE || "Europe/Rome";
@@ -4219,7 +4234,7 @@ Rispondi SOLO JSON valido:
   try {
     const out = await askClaudeJSON(env, system, text);
     const parsed = JSON.parse(cleanJson(out)) as Partial<CalendarEventDraft>;
-    return {
+    const result: CalendarEventDraft = {
       intent: parsed.intent === "calendar_create" ? "calendar_create" : "unknown",
       title: typeof parsed.title === "string" ? parsed.title : null,
       description: typeof parsed.description === "string" ? parsed.description : null,
@@ -4229,9 +4244,13 @@ Rispondi SOLO JSON valido:
       all_day: Boolean(parsed.all_day),
       confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0,
     };
+    return result.intent === "calendar_create" && result.title && result.start_at
+      ? result
+      : (parseDeterministicCalendarEvent(text, timezone) ?? result);
   } catch (error) {
     console.error("[GCAL] Parse evento fallito:", error);
-    return { intent: "unknown", title: null, description: null, location: null, start_at: null, end_at: null, all_day: false, confidence: 0 };
+    return parseDeterministicCalendarEvent(text, timezone)
+      ?? { intent: "unknown", title: null, description: null, location: null, start_at: null, end_at: null, all_day: false, confidence: 0 };
   }
 }
 
