@@ -2601,7 +2601,10 @@ async function createPendingAction(
   params: JsonValue,
 ): Promise<{ id: string; approveData: string; rejectData: string }> {
   const id = crypto.randomUUID();
-  const storedParams = action === "calendar-create" && isRecord(params)
+  // Ogni scrittura Calendar deve avere lo stesso identificativo anche in caso
+  // di retry del callback Telegram: il backend lo usa per non duplicare
+  // creazioni, modifiche o cancellazioni.
+  const storedParams = action.startsWith("calendar-") && isRecord(params)
     ? { ...params, operationId: `calendar_${id.replace(/-/g, "")}` }
     : params;
   const pending: PendingAction = {
@@ -2642,7 +2645,18 @@ async function handlePendingActionCallback(env: Env, chatId: number, callbackDat
     return { reply: "Proposta rifiutata.", action: pending.action };
   }
 
-  const reply = await executePendingAction(env, pending);
+  let reply: string;
+  try {
+    reply = await executePendingAction(env, pending);
+  } catch (error) {
+    if (pending.action.startsWith("calendar-")) {
+      logCalendarFailure("write_failed", {
+        action: pending.action,
+        operationId: asString(asRecord(pending.params).operationId) ?? "missing",
+      }, error);
+    }
+    throw error;
+  }
   await env.SAVERIO_KV.delete(pendingActionKey(id));
   await clearLatestPendingAction(env, chatId, id);
   if (pending.action.startsWith("calendar-")) {
@@ -2813,11 +2827,12 @@ const PENDING_ACTION_HANDLERS: Record<PendingActionType, PendingActionHandler> =
     const eventId = asString(params.eventId);
     const etag = asString(params.etag);
     const currentTitle = asString(params.currentTitle) ?? "Evento";
-    if (!eventId || !etag) throw new Error("proposta modifica calendario non valida");
+    const operationId = asString(params.operationId);
+    if (!eventId || !etag || !operationId) throw new Error("proposta modifica calendario non valida");
     const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + `/calendar/events/${encodeURIComponent(eventId)}`;
     const response = await fetch(endpoint, {
       method: "PATCH",
-      headers: { "content-type": "application/json", "x-agent-key": env.AGENT_KEY },
+      headers: { "content-type": "application/json", "x-agent-key": env.AGENT_KEY, "x-operation-id": operationId },
       body: JSON.stringify({
         etag,
         ...(asString(params.title) ? { title: asString(params.title) } : {}),
@@ -2836,11 +2851,12 @@ const PENDING_ACTION_HANDLERS: Record<PendingActionType, PendingActionHandler> =
     const eventId = asString(params.eventId);
     const etag = asString(params.etag);
     const title = asString(params.title) ?? "Evento";
-    if (!eventId || !etag) throw new Error("proposta cancellazione calendario non valida");
+    const operationId = asString(params.operationId);
+    if (!eventId || !etag || !operationId) throw new Error("proposta cancellazione calendario non valida");
     const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + `/calendar/events/${encodeURIComponent(eventId)}`;
     const response = await fetch(endpoint, {
       method: "DELETE",
-      headers: { "x-agent-key": env.AGENT_KEY, "if-match": etag },
+      headers: { "x-agent-key": env.AGENT_KEY, "if-match": etag, "x-operation-id": operationId },
     });
     if (response.status === 409) throw new Error("L'evento è cambiato nel frattempo: rileggilo e riprova.");
     if (response.status === 404) throw new Error("L'evento non esiste più.");
@@ -3950,6 +3966,12 @@ async function gestisciCalendar(env: Env, chatId: number, text: string): Promise
     });
     return { text: sections.join("\n\n") };
   }
+  // Il piano strutturato e' esaustivo. Il return esplicito impedisce che
+  // qualunque richiesta possa ricadere nella vecchia catena sottostante.
+  return null;
+
+  /* Legacy router removed from execution; retained as a comment until its
+     dead helper functions are removed in the same cleanup commit. */
   if (!isCalendarReadIntent(text) && !isCalendarCreateIntent(text) && !isCalendarMutationIntent(text)) return null;
 
   if (isCalendarMutationIntent(text)) return gestisciMutazioneCalendar(env, chatId, text);
@@ -4163,6 +4185,18 @@ function toRomeBoundaryIso(date: Date, timezone: string): string {
   return `${year}-${month}-${day}T00:00:00${offset}`;
 }
 
+function logCalendarFailure(event: string, context: Record<string, string | number | boolean>, error?: unknown): void {
+  const normalized = error instanceof Error
+    ? { name: error.name, message: error.message, stack: error.stack }
+    : error === undefined ? undefined : { name: "Error", message: String(error) };
+  console.error("[CALENDAR-OP]", JSON.stringify({
+    event,
+    at: new Date().toISOString(),
+    context,
+    ...(normalized ? { error: normalized } : {}),
+  }));
+}
+
 async function listGoogleCalendarEvents(env: Env, timeMin: string, timeMax: string): Promise<GoogleCalendarEvent[] | null> {
   try {
     const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + "/calendar/events";
@@ -4172,13 +4206,19 @@ async function listGoogleCalendarEvents(env: Env, timeMin: string, timeMax: stri
     const response = await fetch(url.toString(), { headers: { "x-agent-key": env.AGENT_KEY } });
     const raw = await response.text();
     if (!response.ok) {
-      console.error("[GCAL] Lettura eventi fallita:", response.status, raw);
+      logCalendarFailure("read_failed", { endpoint: "calendar/events", status: response.status, timeMin, timeMax });
       return null;
     }
-    const data = JSON.parse(raw) as { events?: GoogleCalendarEvent[] };
+    let data: { events?: GoogleCalendarEvent[] };
+    try {
+      data = JSON.parse(raw) as { events?: GoogleCalendarEvent[] };
+    } catch (error) {
+      logCalendarFailure("read_malformed_response", { endpoint: "calendar/events", status: response.status, timeMin, timeMax }, error);
+      return null;
+    }
     return data.events || [];
   } catch (error) {
-    console.error("[GCAL] Errore lettura:", error);
+    logCalendarFailure("read_transport_error", { endpoint: "calendar/events", timeMin, timeMax }, error);
     return null;
   }
 }
