@@ -4318,7 +4318,7 @@ Rispondi SOLO JSON valido:
   try {
     const out = await askClaudeJSON(env, system, text);
     const parsed = JSON.parse(cleanJson(out)) as Partial<CalendarMutationDraft>;
-    return {
+    const result: CalendarMutationDraft = {
       intent: parsed.intent === "calendar_update" || parsed.intent === "calendar_delete" ? parsed.intent : "unknown",
       query: typeof parsed.query === "string" ? parsed.query : null,
       search_start: typeof parsed.search_start === "string" ? parsed.search_start : null,
@@ -4331,10 +4331,49 @@ Rispondi SOLO JSON valido:
       all_day: Boolean(parsed.all_day),
       confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0,
     };
+    return result.intent !== "unknown" && result.query && result.search_start && result.search_end && result.confidence >= 0.65
+      ? result
+      : (parseDeterministicCalendarMutation(text, timezone) ?? result);
   } catch (error) {
-    console.error("[GCAL] Parse modifica/cancellazione fallito:", error);
-    return { intent: "unknown", query: null, search_start: null, search_end: null, title: null, start_at: null, end_at: null, location: null, description: null, all_day: false, confidence: 0 };
+    logCalendarFailure("mutation_parse_failed", { endpoint: "calendar/mutation" }, error);
+    return parseDeterministicCalendarMutation(text, timezone)
+      ?? { intent: "unknown", query: null, search_start: null, search_end: null, title: null, start_at: null, end_at: null, location: null, description: null, all_day: false, confidence: 0 };
   }
+}
+
+function parseDeterministicCalendarMutation(text: string, timezone: string): CalendarMutationDraft | null {
+  const action = /^\s*(sposta|modifica|cambia|aggiorna|rinomina|cancella|elimina|rimuovi)\b/i.exec(text);
+  if (!action) return null;
+  const isDelete = /^(cancella|elimina|rimuovi)$/i.test(action[1]);
+  const dayMatch = /\b(?:di|del|per)\s+(oggi|domani|dopodomani)\b/i.exec(text);
+  if (!dayMatch || dayMatch.index === undefined) return null;
+  const timeMatch = /\balle\s+([01]?\d|2[0-3])(?:[.:,]([0-5]\d))?\b/i.exec(text);
+  if (!isDelete && !timeMatch) return null;
+  const rawQuery = text.slice(action[0].length, dayMatch.index)
+    .replace(/^\s*(?:l['’])?(?:evento|appuntamento|impegno)\s+/i, "")
+    .trim();
+  if (!rawQuery) return null;
+  const dayOffset = dayMatch[1].toLowerCase() === "oggi" ? 0 : dayMatch[1].toLowerCase() === "domani" ? 1 : 2;
+  const today = getRomeDateParts(new Date(), timezone);
+  const day = new Date(Date.UTC(today.year, today.month - 1, today.day + dayOffset));
+  const searchStart = toRomeBoundaryIso(day, timezone);
+  const searchEnd = toRomeBoundaryIso(new Date(day.getTime() + 86_400_000), timezone);
+  const startAt = !isDelete && timeMatch
+    ? toRomeDateTimeIso(day, Number(timeMatch[1]), Number(timeMatch[2] || 0), timezone)
+    : null;
+  return {
+    intent: isDelete ? "calendar_delete" : "calendar_update",
+    query: rawQuery,
+    search_start: searchStart,
+    search_end: searchEnd,
+    title: null,
+    start_at: startAt,
+    end_at: null,
+    location: null,
+    description: null,
+    all_day: false,
+    confidence: 1,
+  };
 }
 
 function cleanJson(text: string): string {
