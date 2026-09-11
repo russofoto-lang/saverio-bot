@@ -1,10 +1,13 @@
 // Saverio — socio senior. Cloudflare Worker.
 import {
   applyMeaningRules,
+  classifyWithLearnedRules,
   parseLearningCommand,
   type LearnedRule,
   type LearningRuleDraft,
 } from "./chat-learning.mts";
+import { classifyCalendarEventTitle } from "./calendar-routing.mts";
+import { isCheckinNo, isCheckinYes, parseCheckinOutcomes, parseRescheduleInstruction } from "./daily-checkin.mts";
 
 // Riceve webhook Telegram, chiama Claude (con web search), risponde su Telegram.
 // La memoria conversazionale vive in KV con scadenza automatica.
@@ -261,6 +264,13 @@ export default {
     // confermati e prima del routing operativo.
     const learnedRules = await loadLearnedRules(env, chatId);
     text = applyMeaningRules(text, learnedRules);
+
+    const checkinReply = await gestisciCheckin(env, chatId, text);
+    if (checkinReply) {
+      await appendHistory(env, chatId, [{ role: "user", content: text }, { role: "assistant", content: checkinReply.text }]);
+      await sendMessage(env, chatId, checkinReply.text, checkinReply.inlineKeyboard ? { inlineKeyboard: checkinReply.inlineKeyboard } : undefined);
+      return new Response("ok");
+    }
 
     const regularizeReply = await handleRegularizeInput(env, chatId, text);
     if (regularizeReply) {
@@ -2758,6 +2768,17 @@ const PENDING_ACTION_HANDLERS: Record<PendingActionType, PendingActionHandler> =
     const body = asRecord(await response.json());
     const id = asString(body.id);
     if (!response.ok || !id) throw new Error(`calendar/create-event ${response.status}`);
+    const checkinChatId = asNumber(params.checkinChatId);
+    const checkinEventKey = asString(params.checkinEventKey);
+    if (checkinChatId !== null && checkinEventKey) {
+      const raw = await env.SAVERIO_KV.get(checkinRescheduleKey(checkinChatId));
+      try {
+        const context = raw ? JSON.parse(raw) as { events?: CheckinEvent[] } : null;
+        const remaining = (context?.events ?? []).filter((event) => event.key !== checkinEventKey);
+        if (remaining.length) await env.SAVERIO_KV.put(checkinRescheduleKey(checkinChatId), JSON.stringify({ events: remaining }), { expirationTtl: 12 * 60 * 60 });
+        else await env.SAVERIO_KV.delete(checkinRescheduleKey(checkinChatId));
+      } catch { await env.SAVERIO_KV.delete(checkinRescheduleKey(checkinChatId)); }
+    }
     return `Evento creato: ${title}\n${formatCalendarDate(startAt, allDay)} (ID ${id}).`;
   },
   "calendar-update": async (env, params) => {
@@ -3674,6 +3695,101 @@ type GoogleCalendarEvent = {
   end?: { dateTime?: string; date?: string };
 };
 type CalendarReply = { text: string; inlineKeyboard?: TelegramInlineButton[][] };
+type CheckinEvent = { key: string; title: string; start: string; end: string; allDay: boolean; location?: string; description?: string };
+type CheckinState = { date: string; events: CheckinEvent[]; outcomes?: Record<string, "fatto" | "non_fatto" | "rimandato"> };
+
+const checkinOfferKey = (chatId: number, day: string) => `daily_checkin_offer:${chatId}:${day}`;
+const checkinStateKey = (chatId: number) => `daily_checkin_state:${chatId}`;
+const checkinRescheduleKey = (chatId: number) => `daily_checkin_reschedule:${chatId}`;
+
+function romeDayIso(timezone: string): string {
+  const parts = getRomeDateParts(new Date(), timezone);
+  return `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
+}
+
+function isMorningInRome(timezone: string): boolean {
+  const hour = Number(new Intl.DateTimeFormat("en-GB", { timeZone: timezone, hour: "2-digit", hourCycle: "h23" }).format(new Date()));
+  return hour >= 4 && hour < 12;
+}
+
+function toCheckinEvent(event: GoogleCalendarEvent): CheckinEvent {
+  const start = event.start?.dateTime || event.start?.date || "";
+  return { key: event.id || `${normalizeForMatch(event.summary || "senza titolo")}|${start}`, title: event.summary || "Senza titolo", start, end: event.end?.dateTime || event.end?.date || "", allDay: Boolean(event.start?.date), ...(event.location ? { location: event.location } : {}), ...(event.description ? { description: event.description } : {}) };
+}
+
+function formatCheckinEvents(events: CheckinEvent[]): string {
+  return events.map((event, index) => `${index + 1}. ${event.title}`).join("\n");
+}
+
+async function loadCheckinState(env: Env, chatId: number): Promise<CheckinState | null> {
+  const raw = await env.SAVERIO_KV.get(checkinStateKey(chatId));
+  if (!raw) return null;
+  try { const state = JSON.parse(raw) as CheckinState; return state.date && Array.isArray(state.events) ? state : null; } catch { return null; }
+}
+
+async function previousWorkdayCheckin(env: Env, chatId: number): Promise<CalendarReply> {
+  const timezone = env.TIMEZONE || "Europe/Rome";
+  const today = getRomeDateParts(new Date(), timezone);
+  const rules = await loadLearnedRules(env, chatId);
+  for (let daysBack = 1; daysBack <= 7; daysBack += 1) {
+    const day = new Date(Date.UTC(today.year, today.month - 1, today.day - daysBack));
+    const next = new Date(day); next.setUTCDate(next.getUTCDate() + 1);
+    const events = await listGoogleCalendarEvents(env, toRomeBoundaryIso(day, timezone), toRomeBoundaryIso(next, timezone));
+    if (events === null) return { text: "Non riesco a leggere Calendar per il check-in. Riprova tra poco." };
+    const work = events.filter((event) => (classifyWithLearnedRules(event.summary || "", rules) ?? classifyCalendarEventTitle(event.summary || "")) === "work").map(toCheckinEvent);
+    if (!work.length) continue;
+    const state: CheckinState = { date: day.toISOString().slice(0, 10), events: work };
+    await env.SAVERIO_KV.put(checkinStateKey(chatId), JSON.stringify(state), { expirationTtl: 12 * 60 * 60 });
+    return { text: `Punto degli impegni lavorativi del ${state.date}:\n${formatCheckinEvents(work)}\n\nDimmi l'esito di tutti, per esempio: 1 fatto, 2 non fatto.` };
+  }
+  return { text: "Non ho trovato impegni lavorativi negli ultimi sette giorni da verificare." };
+}
+
+async function gestisciCheckin(env: Env, chatId: number, text: string): Promise<CalendarReply | null> {
+  const timezone = env.TIMEZONE || "Europe/Rome";
+  const today = romeDayIso(timezone);
+  if (await env.SAVERIO_KV.get(checkinOfferKey(chatId, today))) {
+    if (isCheckinYes(text)) return previousWorkdayCheckin(env, chatId);
+    if (isCheckinNo(text)) return { text: "Va bene, non faccio il punto adesso." };
+  }
+  const rescheduleRaw = await env.SAVERIO_KV.get(checkinRescheduleKey(chatId));
+  if (rescheduleRaw) {
+    try {
+      const context = JSON.parse(rescheduleRaw) as { events?: CheckinEvent[] };
+      const events = Array.isArray(context.events) ? context.events : [];
+      const instruction = parseRescheduleInstruction(text, events.length);
+      if (instruction.kind === "drop") {
+        const event = events[instruction.index];
+        const remaining = events.filter((_, index) => index !== instruction.index);
+        if (remaining.length) await env.SAVERIO_KV.put(checkinRescheduleKey(chatId), JSON.stringify({ events: remaining }), { expirationTtl: 12 * 60 * 60 });
+        else await env.SAVERIO_KV.delete(checkinRescheduleKey(chatId));
+        return { text: `Va bene: “${event.title}” non verrà riprogrammato.` };
+      }
+      if (instruction.kind === "reschedule") {
+        const event = events[instruction.index];
+        const draft = await parseCalendarEvent(env, `Appuntamento: ${event.title}. ${instruction.when}`);
+        if (draft.intent !== "calendar_create" || !draft.start_at) return { text: `Non ho capito quando riprogrammare “${event.title}”. Prova: ${instruction.index + 1} domani alle 10.` };
+        const duration = event.start && event.end && !event.allDay ? Math.max(15, Math.round((Date.parse(event.end) - Date.parse(event.start)) / 60_000)) : 60;
+        const endAt = draft.end_at || addMinutesIso(draft.start_at, draft.all_day ? 24 * 60 : duration);
+        const pending = await createPendingAction(env, chatId, "calendar-create", { title: event.title, startAt: draft.start_at, endAt, allDay: draft.all_day, location: event.location, description: event.description, checkinChatId: chatId, checkinEventKey: event.key });
+        return { text: `Riprogrammo senza toccare l'evento storico.\nTitolo: ${event.title}\nQuando: ${formatCalendarDate(draft.start_at, draft.all_day)}`, inlineKeyboard: [[{ text: "Crea nuovo impegno", callback_data: pending.approveData }, { text: "Annulla", callback_data: pending.rejectData }]] };
+      }
+    } catch { await env.SAVERIO_KV.delete(checkinRescheduleKey(chatId)); }
+  }
+  const state = await loadCheckinState(env, chatId);
+  if (!state) return null;
+  const outcomes = parseCheckinOutcomes(text, state.events.length);
+  if (!outcomes.length) return { text: `Rispondi indicando numero ed esito, per esempio: 1 fatto, 2 non fatto.\n${formatCheckinEvents(state.events)}` };
+  const merged = { ...(state.outcomes || {}) }; for (const item of outcomes) merged[state.events[item.index].key] = item.outcome;
+  const missing = state.events.filter((event) => !merged[event.key]);
+  if (missing.length) { await env.SAVERIO_KV.put(checkinStateKey(chatId), JSON.stringify({ ...state, outcomes: merged }), { expirationTtl: 12 * 60 * 60 }); return { text: `Mi manca ancora:\n${formatCheckinEvents(missing)}` }; }
+  await createFirestoreDocument(env, "calendar_reports", { date: state.date, source: "telegram_morning_checkin", createdAt: new Date().toISOString(), outcomes: state.events.map((event) => ({ title: event.title, start: event.start, outcome: merged[event.key] })) });
+  await env.SAVERIO_KV.delete(checkinStateKey(chatId));
+  const unfinished = state.events.filter((event) => merged[event.key] !== "fatto");
+  if (!unfinished.length) return { text: "Punto salvato: tutti gli impegni indicati risultano svolti." };
+  await env.SAVERIO_KV.put(checkinRescheduleKey(chatId), JSON.stringify({ date: state.date, events: unfinished }), { expirationTtl: 12 * 60 * 60 });
+  return { text: `Punto salvato. Da riprogrammare o chiudere:\n${formatCheckinEvents(unfinished)}\n\nPer riprogrammare: 1 domani alle 10. Per chiudere: 1 non serve. Non ho modificato nulla automaticamente.` };
+}
 
 function isCalendarIntent(text: string): boolean {
   const value = normalizeForMatch(text);
@@ -3731,7 +3847,17 @@ async function gestisciCalendar(env: Env, chatId: number, text: string): Promise
     if (events === null) {
       return { text: "Non riesco a leggere Google Calendar in questo momento. Controlliamo token e permessi." };
     }
-    return { text: formatGoogleCalendarEvents(events, range.label, env.TIMEZONE || "Europe/Rome") };
+    const timezone = env.TIMEZONE || "Europe/Rome";
+    let textReply = formatGoogleCalendarEvents(events, range.label, timezone);
+    if (range.label === "oggi" && isMorningInRome(timezone)) {
+      const day = romeDayIso(timezone);
+      const key = checkinOfferKey(chatId, day);
+      if (!await env.SAVERIO_KV.get(key)) {
+        await env.SAVERIO_KV.put(key, JSON.stringify({ offeredAt: new Date().toISOString() }), { expirationTtl: 36 * 60 * 60 });
+        textReply += "\n\nVuoi fare anche il punto degli impegni lavorativi dell'ultimo giorno con attività? Rispondi sì oppure non ora.";
+      }
+    }
+    return { text: textReply };
   }
 
   const draft = await parseCalendarEvent(env, text);
