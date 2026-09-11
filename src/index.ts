@@ -7,8 +7,9 @@ import {
   type LearningRuleDraft,
 } from "./chat-learning.mts";
 import { classifyCalendarEventTitle, planCalendarRead, type CalendarReadRange } from "./calendar-routing.mts";
-import { isCheckinNo, isCheckinYes, parseCheckinOutcomes, parseRescheduleInstruction } from "./daily-checkin.mts";
+import { isCheckinNo, isCheckinYes, isDirectCheckinIntent, parseCheckinOutcomes, parseRescheduleInstruction } from "./daily-checkin.mts";
 import { analyzeAgenda, type AgendaRealisticEvent } from "./agenda-realistica.mts";
+import { extractNoteCapture } from "./note-capture.mts";
 
 // Riceve webhook Telegram, chiama Claude (con web search), risponde su Telegram.
 // La memoria conversazionale vive in KV con scadenza automatica.
@@ -251,6 +252,13 @@ export default {
       return new Response("ok");
     }
 
+    const checkinReply = await gestisciCheckin(env, chatId, text);
+    if (checkinReply) {
+      await appendHistory(env, chatId, [{ role: "user", content: text }, { role: "assistant", content: checkinReply.text }]);
+      await sendMessage(env, chatId, checkinReply.text, checkinReply.inlineKeyboard ? { inlineKeyboard: checkinReply.inlineKeyboard } : undefined);
+      return new Response("ok");
+    }
+
     const learningReply = await gestisciApprendimentoChat(env, chatId, text);
     if (learningReply) {
       await appendHistory(env, chatId, [
@@ -265,13 +273,6 @@ export default {
     // confermati e prima del routing operativo.
     const learnedRules = await loadLearnedRules(env, chatId);
     text = applyMeaningRules(text, learnedRules);
-
-    const checkinReply = await gestisciCheckin(env, chatId, text);
-    if (checkinReply) {
-      await appendHistory(env, chatId, [{ role: "user", content: text }, { role: "assistant", content: checkinReply.text }]);
-      await sendMessage(env, chatId, checkinReply.text, checkinReply.inlineKeyboard ? { inlineKeyboard: checkinReply.inlineKeyboard } : undefined);
-      return new Response("ok");
-    }
 
     const realisticAgendaReply = await gestisciAgendaRealistica(env, chatId, text);
     if (realisticAgendaReply) {
@@ -469,6 +470,16 @@ export default {
         { role: "assistant", content: confermaReply },
       ]);
       await sendMessage(env, chatId, confermaReply);
+      return new Response("ok");
+    }
+
+    const noteReply = await gestisciNotaBlocNotes(env, chatId, msg.message_id, text);
+    if (noteReply) {
+      await appendHistory(env, chatId, [
+        { role: "user", content: text },
+        { role: "assistant", content: noteReply },
+      ]);
+      await sendMessage(env, chatId, noteReply);
       return new Response("ok");
     }
 
@@ -3759,11 +3770,29 @@ async function previousWorkdayCheckin(env: Env, chatId: number): Promise<Calenda
   return { text: "Non ho trovato impegni lavorativi negli ultimi sette giorni da verificare." };
 }
 
+async function yesterdayCheckin(env: Env, chatId: number): Promise<CalendarReply> {
+  const timezone = env.TIMEZONE || "Europe/Rome";
+  const today = getRomeDateParts(new Date(), timezone);
+  const day = new Date(Date.UTC(today.year, today.month - 1, today.day - 1));
+  const next = new Date(day); next.setUTCDate(next.getUTCDate() + 1);
+  const events = await listGoogleCalendarEvents(env, toRomeBoundaryIso(day, timezone), toRomeBoundaryIso(next, timezone));
+  if (events === null) return { text: "Non riesco a leggere Calendar per il check-in. Riprova tra poco." };
+  const rules = await loadLearnedRules(env, chatId);
+  const work = events
+    .filter((event) => (classifyWithLearnedRules(event.summary || "", rules) ?? classifyCalendarEventTitle(event.summary || "")) === "work")
+    .map(toCheckinEvent);
+  if (!work.length) return { text: "Ieri non risultano impegni lavorativi in Calendar da verificare." };
+  const state: CheckinState = { date: day.toISOString().slice(0, 10), events: work };
+  await env.SAVERIO_KV.put(checkinStateKey(chatId), JSON.stringify(state), { expirationTtl: 12 * 60 * 60 });
+  return { text: `Impegni lavorativi di ieri (${state.date}):\n${formatCheckinEvents(work)}\n\nDimmi l'esito di tutti, per esempio: 1 fatto, 2 non fatto.` };
+}
+
 async function gestisciCheckin(env: Env, chatId: number, text: string): Promise<CalendarReply | null> {
   const timezone = env.TIMEZONE || "Europe/Rome";
   const today = romeDayIso(timezone);
+  if (isDirectCheckinIntent(text)) return yesterdayCheckin(env, chatId);
   if (await env.SAVERIO_KV.get(checkinOfferKey(chatId, today))) {
-    if (isCheckinYes(text)) return previousWorkdayCheckin(env, chatId);
+    if (isCheckinYes(text)) return yesterdayCheckin(env, chatId);
     if (isCheckinNo(text)) return { text: "Va bene, non faccio il punto adesso." };
   }
   const rescheduleRaw = await env.SAVERIO_KV.get(checkinRescheduleKey(chatId));
@@ -5052,6 +5081,30 @@ async function gestisciSegna(env: Env, chatId: number, history: Turn[]): Promise
   const { testo, cliente } = await sintetizzaDecisione(env, history);
   await savePendingDecision(env, chatId, { testo, cliente, createdAt: Date.now() });
   return `Segno questa:\n\n"${testo}"${cliente ? `\n(${cliente})` : ""}\n\nConfermi?`;
+}
+
+async function gestisciNotaBlocNotes(env: Env, chatId: number, messageId: number, text: string): Promise<string | null> {
+  const fact = extractNoteCapture(text);
+  if (!fact) return null;
+  const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + "/notes/capture";
+  const operationId = `note_capture_${chatId}_${messageId}`;
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-agent-key": env.AGENT_KEY, "x-operation-id": operationId },
+      body: JSON.stringify({ client: "", project: null, fact }),
+    });
+    const body = asRecord(await response.json().catch(() => null));
+    if (!response.ok || body.ok !== true || body.outcome !== "saved") {
+      console.error("[BLOCNOTES] salvataggio nota fallito", { chatId, messageId, status: response.status, error: asString(body.error) ?? "risposta non valida" });
+      return "Non sono riuscito a salvarla su BlocNotes. Non la considero registrata: riprova tra poco.";
+    }
+    const title = asString(body.title) ?? "Nota Telegram";
+    return `Salvato e verificato su BlocNotes: ${title}.`;
+  } catch (error) {
+    console.error("[BLOCNOTES] errore salvataggio nota", { chatId, messageId, error: error instanceof Error ? error.message : String(error) });
+    return "Non sono riuscito a salvarla su BlocNotes. Non la considero registrata: riprova tra poco.";
+  }
 }
 
 async function gestisciConfermaSegna(env: Env, chatId: number, msg: string): Promise<string | null> {

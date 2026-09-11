@@ -30,6 +30,7 @@ test("trasforma una correzione Calendar in una classificazione", () => {
 
 test("una frase ordinaria non viene salvata come apprendimento", () => {
   assert.deepEqual(parseLearningCommand("Mounjaro e personale"), { kind: "none" });
+  assert.deepEqual(parseLearningCommand("Non fatto"), { kind: "none" });
 });
 
 test("una preferenza esplicita diventa una proposta di comportamento", () => {

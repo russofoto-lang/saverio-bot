@@ -42,6 +42,10 @@ export function isCheckinNo(text: string): boolean {
   return /^(?:no|non ora|salta|non adesso|dopo)$/.test(normalize(text));
 }
 
+export function isDirectCheckinIntent(text: string): boolean {
+  return /^(?:check[ -]?in|fai(?:mi)? il check[ -]?in|fammi il check[ -]?in|facciamo il check[ -]?in|punto della situazione)$/.test(normalize(text));
+}
+
 export function parseRescheduleInstruction(text: string, eventCount: number): RescheduleInstruction {
   const value = normalize(text);
   const drop = value.match(/^(\d+)\s+(?:non serve|annulla|lascia perdere|chiudi)$/);

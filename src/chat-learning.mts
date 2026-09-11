@@ -60,7 +60,9 @@ export function parseLearningCommand(text: string): LearningCommand {
     }
   }
 
-  const explicitCorrection = /^(?:no[,;:]?|hai sbagliato[,;:]?|correzione\s*:|impara\s*:|impara che\b|ricorda come regola(?: che)?\b|da ora in poi\b)/.test(value);
+  // "non fatto" e "non ora" non sono correzioni: il confine di parola dopo
+  // "no" evita di trasformarli in una finta regola da imparare.
+  const explicitCorrection = /^(?:no\b\s*[,;:]|hai sbagliato[,;:]?|correzione\s*:|impara\s*:|impara che\b|ricorda come regola(?: che)?\b|da ora in poi\b)/.test(value);
   if (!explicitCorrection) return { kind: "none" };
 
   const withoutPrefix = original

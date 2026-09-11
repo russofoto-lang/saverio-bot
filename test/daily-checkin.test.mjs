@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   isCheckinNo,
   isCheckinYes,
+  isDirectCheckinIntent,
   parseCheckinOutcomes,
   parseRescheduleInstruction,
 } from "../src/daily-checkin.mts";
@@ -20,6 +21,12 @@ test("riconosce risposta positiva e rinvio del check-in", () => {
   assert.equal(isCheckinYes("Sì"), true);
   assert.equal(isCheckinYes("vai"), true);
   assert.equal(isCheckinNo("non ora"), true);
+});
+
+test("riconosce il comando check-in esplicito", () => {
+  assert.equal(isDirectCheckinIntent("Check-in"), true);
+  assert.equal(isDirectCheckinIntent("fammi il check in"), true);
+  assert.equal(isDirectCheckinIntent("impegni di ieri"), false);
 });
 
 test("interpreta riprogrammazione e chiusura di un impegno incompleto", () => {
