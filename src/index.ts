@@ -5314,8 +5314,9 @@ async function gestisciNotaBlocNotes(env: Env, chatId: number, messageId: number
       url.searchParams.set("q", deleteQuery);
       const response = await fetch(url.toString(), { headers: { "x-agent-key": env.AGENT_KEY } });
       const body = asRecord(await response.json().catch(() => null));
-      const matches = (Array.isArray(body.matches) ? body.matches.filter(isRecord) : [])
-        .filter(match => matchesNoteText(deleteQuery, `${asString(match.title) ?? ""} ${asString(match.excerpt) ?? ""}`));
+      // /notes/find-exact ha gia verificato ogni termine direttamente sul
+      // testo della nota: qui non possiamo ricontrollare il solo titolo.
+      const matches = Array.isArray(body.matches) ? body.matches.filter(isRecord) : [];
       if (!response.ok) return { text: "Non riesco a cercare la nota su BlocNotes: non ho cancellato nulla." };
       if (!matches.length) return { text: "Non trovo una nota BlocNotes che corrisponda. Non ho cancellato nulla." };
       if (matches.length > 1) {
