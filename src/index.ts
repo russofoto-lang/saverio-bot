@@ -4117,9 +4117,11 @@ async function listGoogleCalendarEvents(env: Env, timeMin: string, timeMax: stri
   }
 }
 
+const MAX_CALENDAR_EVENTS_PER_REPLY = 30;
+
 function formatGoogleCalendarEvents(events: GoogleCalendarEvent[], label: string, timezone: string): string {
   if (!events.length) return `Nessun appuntamento in calendario per ${label}.`;
-  const lines = events.slice(0, 10).map((event) => {
+  const lines = events.slice(0, MAX_CALENDAR_EVENTS_PER_REPLY).map((event) => {
     const start = event.start?.dateTime || event.start?.date;
     const when = event.start?.date
       ? "Tutto il giorno"
@@ -4128,7 +4130,9 @@ function formatGoogleCalendarEvents(events: GoogleCalendarEvent[], label: string
         : "Orario non disponibile";
     return `- ${when} - ${event.summary || "Senza titolo"}${event.location ? ` (${event.location})` : ""}`;
   });
-  const more = events.length > 10 ? `\n…e altri ${events.length - 10}.` : "";
+  const more = events.length > MAX_CALENDAR_EVENTS_PER_REPLY
+    ? `\n\nMostro ${lines.length} di ${events.length} eventi.`
+    : "";
   return `Calendario ${label}:\n${lines.join("\n")}${more}`;
 }
 
