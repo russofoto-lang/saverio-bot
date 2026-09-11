@@ -14,7 +14,7 @@ id = "d2d8e8b8343e43ad9a87e49c963f52a2"
 #   wrangler secret put ANTHROPIC_API_KEY
 #   wrangler secret put WEBHOOK_SECRET   (una stringa a caso che inventi tu)
 [vars]
-TASK_URL = "https://sm-backend-tnq9.onrender.com/task"
+TASK_URL = "https://sm-backend-hsjjspcpnq-ew.a.run.app/task"
 
 # 05:30 UTC = 07:30 italiane in ora legale. In inverno verificare l'orario.
 [triggers]
