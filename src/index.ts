@@ -6,7 +6,7 @@ import {
   type LearnedRule,
   type LearningRuleDraft,
 } from "./chat-learning.mts";
-import { classifyCalendarEventTitle } from "./calendar-routing.mts";
+import { classifyCalendarEventTitle, planCalendarRead, type CalendarReadRange } from "./calendar-routing.mts";
 import { isCheckinNo, isCheckinYes, parseCheckinOutcomes, parseRescheduleInstruction } from "./daily-checkin.mts";
 import { analyzeAgenda, type AgendaRealisticEvent } from "./agenda-realistica.mts";
 
@@ -3709,6 +3709,12 @@ type CheckinState = { date: string; events: CheckinEvent[]; outcomes?: Record<st
 const checkinOfferKey = (chatId: number, day: string) => `daily_checkin_offer:${chatId}:${day}`;
 const checkinStateKey = (chatId: number) => `daily_checkin_state:${chatId}`;
 const checkinRescheduleKey = (chatId: number) => `daily_checkin_reschedule:${chatId}`;
+const calendarReadContextKey = (chatId: number) => `calendar_read_context:${chatId}`;
+
+async function loadCalendarReadContext(env: Env, chatId: number): Promise<CalendarReadRange[] | null> {
+  const raw = await env.SAVERIO_KV.get(calendarReadContextKey(chatId));
+  try { const value = raw ? JSON.parse(raw) : null; return Array.isArray(value) ? value.filter((item): item is CalendarReadRange => typeof item?.start === "string" && typeof item?.end === "string" && typeof item?.label === "string") : null; } catch { return null; }
+}
 
 function romeDayIso(timezone: string): string {
   const parts = getRomeDateParts(new Date(), timezone);
@@ -3877,6 +3883,23 @@ function isCalendarReadIntent(text: string): boolean {
 }
 
 async function gestisciCalendar(env: Env, chatId: number, text: string): Promise<CalendarReply | null> {
+  const timezone = env.TIMEZONE || "Europe/Rome";
+  const readPlan = planCalendarRead(text, timezone, await loadCalendarReadContext(env, chatId));
+  if (readPlan.kind === "capability") return { text: "Sì, posso leggere il tuo Google Calendar e cercare gli impegni per data o periodo." };
+  if (readPlan.kind === "invalid_period") return { text: "La data indicata non esiste. Dimmi una data valida e la cerco in Calendar." };
+  if (readPlan.kind === "needs_period") return { text: "Dimmi per quale giorno o periodo devo controllare Calendar." };
+  if (readPlan.kind === "read") {
+    const results = await Promise.all(readPlan.ranges.map(async (range) => ({ range, events: await listGoogleCalendarEvents(env, range.start, range.end) })));
+    if (results.some((result) => result.events === null)) return { text: "Non riesco a leggere Google Calendar in questo momento. Riprova tra poco." };
+    await env.SAVERIO_KV.put(calendarReadContextKey(chatId), JSON.stringify(readPlan.ranges), { expirationTtl: 12 * 60 * 60 });
+    const rules = readPlan.filter === "work" ? await loadLearnedRules(env, chatId) : [];
+    const sections = results.map(({ range, events }) => {
+      const selected = (events ?? []).filter((event) => readPlan.filter !== "work" || (classifyWithLearnedRules(event.summary || "", rules) ?? classifyCalendarEventTitle(event.summary || "")) === "work");
+      const formatted = formatGoogleCalendarEvents(selected, range.label, timezone);
+      return readPlan.filter === "work" && !selected.length ? `Nessun impegno lavorativo in calendario per ${range.label}.` : formatted;
+    });
+    return { text: sections.join("\n\n") };
+  }
   if (!isCalendarReadIntent(text) && !isCalendarIntent(text) && !isCalendarMutationIntent(text)) return null;
 
   if (isCalendarMutationIntent(text)) return gestisciMutazioneCalendar(env, chatId, text);
