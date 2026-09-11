@@ -2446,7 +2446,6 @@ async function askGeminiText(
         })),
         generationConfig: {
           maxOutputTokens,
-          thinkingLevel: json ? "minimal" : "low",
           ...(json ? { responseMimeType: "application/json" } : {}),
         },
       }),
