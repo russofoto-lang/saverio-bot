@@ -11,6 +11,7 @@ import { isCheckinNo, isCheckinYes, isDirectCheckinIntent, parseCheckinOutcomes,
 import { analyzeAgenda, type AgendaRealisticEvent } from "./agenda-realistica.mts";
 import { extractNoteCapture } from "./note-capture.mts";
 import { isCalendarCreateIntent } from "./calendar-create-intent.mts";
+import { interpretCalendarOperation } from "./calendar-operation.mts";
 
 // Riceve webhook Telegram, chiama Claude (con web search), risponde su Telegram.
 // La memoria conversazionale vive in KV con scadenza automatica.
@@ -2641,6 +2642,9 @@ async function handlePendingActionCallback(env: Env, chatId: number, callbackDat
   const reply = await executePendingAction(env, pending);
   await env.SAVERIO_KV.delete(pendingActionKey(id));
   await clearLatestPendingAction(env, chatId, id);
+  if (pending.action.startsWith("calendar-")) {
+    await env.SAVERIO_KV.put(calendarOperationStatusKey(chatId), reply, { expirationTtl: 30 * 24 * 60 * 60 });
+  }
   return {
     reply,
     action: pending.action,
@@ -3733,10 +3737,24 @@ const checkinOfferKey = (chatId: number, day: string) => `daily_checkin_offer:${
 const checkinStateKey = (chatId: number) => `daily_checkin_state:${chatId}`;
 const checkinRescheduleKey = (chatId: number) => `daily_checkin_reschedule:${chatId}`;
 const calendarReadContextKey = (chatId: number) => `calendar_read_context:${chatId}`;
+const calendarOperationStatusKey = (chatId: number) => `calendar_operation_status:${chatId}`;
 
 async function loadCalendarReadContext(env: Env, chatId: number): Promise<CalendarReadRange[] | null> {
   const raw = await env.SAVERIO_KV.get(calendarReadContextKey(chatId));
   try { const value = raw ? JSON.parse(raw) : null; return Array.isArray(value) ? value.filter((item): item is CalendarReadRange => typeof item?.start === "string" && typeof item?.end === "string" && typeof item?.label === "string") : null; } catch { return null; }
+}
+
+async function getCalendarOperationStatus(env: Env, chatId: number): Promise<CalendarReply> {
+  const pendingId = await env.SAVERIO_KV.get(latestPendingActionKey(chatId));
+  if (pendingId) {
+    const raw = await env.SAVERIO_KV.get(pendingActionKey(pendingId));
+    try {
+      const pending = raw ? JSON.parse(raw) as PendingAction : null;
+      if (pending?.action.startsWith("calendar-")) return { text: "C'è una proposta Calendar ancora da confermare. Finché non premi il pulsante Crea non è stato inserito nulla." };
+    } catch { /* proposta non leggibile: si controlla l'ultimo esito verificato */ }
+  }
+  const result = await env.SAVERIO_KV.get(calendarOperationStatusKey(chatId));
+  return result ? { text: result } : { text: "Non ho un'operazione Calendar verificata recente. Dimmi titolo e data dell'appuntamento e lo controllo." };
 }
 
 function romeDayIso(timezone: string): string {
@@ -3907,14 +3925,19 @@ function isCalendarReadIntent(text: string): boolean {
 
 async function gestisciCalendar(env: Env, chatId: number, text: string): Promise<CalendarReply | null> {
   const timezone = env.TIMEZONE || "Europe/Rome";
-  const readPlan = planCalendarRead(text, timezone, await loadCalendarReadContext(env, chatId));
-  if (readPlan.kind === "capability") return { text: "Sì, posso leggere il tuo Google Calendar e cercare gli impegni per data o periodo." };
+  const operation = interpretCalendarOperation(text, timezone, await loadCalendarReadContext(env, chatId));
+  if (operation.kind === "capability") return { text: "Sì, posso leggere il tuo Google Calendar e cercare gli impegni per data o periodo." };
+  if (operation.kind === "status") return getCalendarOperationStatus(env, chatId);
+  if (operation.kind === "none") return null;
+  if (operation.kind === "mutate") return gestisciMutazioneCalendar(env, chatId, text);
+  if (operation.kind === "create") return gestisciCreazioneCalendar(env, chatId, text);
+  const readPlan = operation.plan;
   if (readPlan.kind === "invalid_period") return { text: "La data indicata non esiste. Dimmi una data valida e la cerco in Calendar." };
   if (readPlan.kind === "needs_period") return { text: "Dimmi per quale giorno o periodo devo controllare Calendar." };
   if (readPlan.kind === "read") {
+    await env.SAVERIO_KV.put(calendarReadContextKey(chatId), JSON.stringify(readPlan.ranges), { expirationTtl: 12 * 60 * 60 });
     const results = await Promise.all(readPlan.ranges.map(async (range) => ({ range, events: await listGoogleCalendarEvents(env, range.start, range.end) })));
     if (results.some((result) => result.events === null)) return { text: "Non riesco a leggere Google Calendar in questo momento. Riprova tra poco." };
-    await env.SAVERIO_KV.put(calendarReadContextKey(chatId), JSON.stringify(readPlan.ranges), { expirationTtl: 12 * 60 * 60 });
     const rules = readPlan.filter === "work" ? await loadLearnedRules(env, chatId) : [];
     const sections = results.map(({ range, events }) => {
       const selected = (events ?? []).filter((event) => readPlan.filter !== "work" || (classifyWithLearnedRules(event.summary || "", rules) ?? classifyCalendarEventTitle(event.summary || "")) === "work");
@@ -3961,6 +3984,22 @@ async function gestisciCalendar(env: Env, chatId: number, text: string): Promise
   return {
     text: `📅 Confermi?\nTitolo: ${draft.title}\nQuando: ${formatCalendarDate(startAt, draft.all_day)}${draft.location ? `\nLuogo: ${draft.location}` : ""}`,
     inlineKeyboard: [[{ text: "✅ Crea", callback_data: pending.approveData }, { text: "❌ Annulla", callback_data: pending.rejectData }]],
+  };
+}
+
+async function gestisciCreazioneCalendar(env: Env, chatId: number, text: string): Promise<CalendarReply> {
+  const draft = await parseCalendarEvent(env, text);
+  if (draft.intent !== "calendar_create" || draft.confidence < 0.65) return { text: "Non ho capito con certezza data, ora o titolo. Dimmi cosa correggere: non ho creato nulla." };
+  if (!draft.title) return { text: "Mi manca il titolo dell'appuntamento." };
+  if (!draft.start_at) return { text: "Mi manca data o ora dell'appuntamento." };
+  const startAt = draft.start_at;
+  const endAt = draft.end_at || addMinutesIso(startAt, draft.all_day ? 24 * 60 : 60);
+  const pending = await createPendingAction(env, chatId, "calendar-create", {
+    title: draft.title, startAt, endAt, allDay: draft.all_day, location: draft.location, description: draft.description,
+  });
+  return {
+    text: `Confermi la creazione in Google Calendar?\nTitolo: ${draft.title}\nQuando: ${formatCalendarDate(startAt, draft.all_day)}${draft.location ? `\nLuogo: ${draft.location}` : ""}`,
+    inlineKeyboard: [[{ text: "Crea in Calendar", callback_data: pending.approveData }, { text: "Annulla", callback_data: pending.rejectData }]],
   };
 }
 
