@@ -8,6 +8,7 @@ import {
 } from "./chat-learning.mts";
 import { classifyCalendarEventTitle } from "./calendar-routing.mts";
 import { isCheckinNo, isCheckinYes, parseCheckinOutcomes, parseRescheduleInstruction } from "./daily-checkin.mts";
+import { analyzeAgenda, type AgendaRealisticEvent } from "./agenda-realistica.mts";
 
 // Riceve webhook Telegram, chiama Claude (con web search), risponde su Telegram.
 // La memoria conversazionale vive in KV con scadenza automatica.
@@ -269,6 +270,13 @@ export default {
     if (checkinReply) {
       await appendHistory(env, chatId, [{ role: "user", content: text }, { role: "assistant", content: checkinReply.text }]);
       await sendMessage(env, chatId, checkinReply.text, checkinReply.inlineKeyboard ? { inlineKeyboard: checkinReply.inlineKeyboard } : undefined);
+      return new Response("ok");
+    }
+
+    const realisticAgendaReply = await gestisciAgendaRealistica(env, chatId, text);
+    if (realisticAgendaReply) {
+      await appendHistory(env, chatId, [{ role: "user", content: text }, { role: "assistant", content: realisticAgendaReply.text }]);
+      await sendMessage(env, chatId, realisticAgendaReply.text);
       return new Response("ok");
     }
 
@@ -3789,6 +3797,38 @@ async function gestisciCheckin(env: Env, chatId: number, text: string): Promise<
   if (!unfinished.length) return { text: "Punto salvato: tutti gli impegni indicati risultano svolti." };
   await env.SAVERIO_KV.put(checkinRescheduleKey(chatId), JSON.stringify({ date: state.date, events: unfinished }), { expirationTtl: 12 * 60 * 60 });
   return { text: `Punto salvato. Da riprogrammare o chiudere:\n${formatCheckinEvents(unfinished)}\n\nPer riprogrammare: 1 domani alle 10. Per chiudere: 1 non serve. Non ho modificato nulla automaticamente.` };
+}
+
+function isAgendaRealisticaIntent(text: string): boolean {
+  const value = normalizeForMatch(text);
+  return value === "agenda realistica" || value === "agenda realistica oggi" || value === "giornata realistica" || value === "come e messa la giornata" || value === "quanto e piena la giornata";
+}
+
+function formatAgendaDuration(minutes: number): string {
+  const hours = Math.floor(minutes / 60); const rest = minutes % 60;
+  return !hours ? `${rest} min` : rest ? `${hours} h ${rest} min` : `${hours} h`;
+}
+
+async function gestisciAgendaRealistica(env: Env, chatId: number, text: string): Promise<CalendarReply | null> {
+  if (!isAgendaRealisticaIntent(text)) return null;
+  const timezone = env.TIMEZONE || "Europe/Rome";
+  const range = getCalendarReadRange("oggi", timezone);
+  const events = await listGoogleCalendarEvents(env, range.start, range.end);
+  if (events === null) return { text: "Non riesco a leggere Calendar per l'agenda realistica. Riprova tra poco." };
+  const seen = new Set<string>();
+  const unique = events.filter((event) => { const start = event.start?.dateTime || event.start?.date || ""; const key = `${normalizeForMatch(event.summary || "senza titolo")}|${start}`; if (seen.has(key)) return false; seen.add(key); return true; });
+  const agendaEvents: AgendaRealisticEvent[] = unique.map((event) => ({ title: event.summary || "Senza titolo", start: event.start?.dateTime || event.start?.date || "", end: event.end?.dateTime || event.end?.date || "", allDay: Boolean(event.start?.date) }));
+  const date = range.start.slice(0, 10); const offset = range.start.slice(-6);
+  const analysis = analyzeAgenda(agendaEvents, `${date}T08:00:00${offset}`, `${date}T20:00:00${offset}`);
+  const rules = await loadLearnedRules(env, chatId);
+  const workCount = unique.filter((event) => (classifyWithLearnedRules(event.summary || "", rules) ?? classifyCalendarEventTitle(event.summary || "")) === "work").length;
+  if (!unique.length) return { text: "Agenda realistica di oggi:\n- Nessun impegno in Calendar.\n- Fascia libera considerata: 08:00–20:00." };
+  const lines = ["Agenda realistica di oggi:", `- ${analysis.timedEvents.length} impegni con orario${workCount ? `, ${workCount} lavorativi` : ""}${analysis.allDayCount ? `; ${analysis.allDayCount} tutto il giorno` : ""}.`, `- Tempo occupato tra le 08:00 e le 20:00: ${formatAgendaDuration(analysis.busyMinutes)}.`];
+  for (const conflict of analysis.conflicts) lines.push(`⚠️ Sovrapposizione: “${conflict.first.title}” e “${conflict.second.title}”.`);
+  for (const transition of analysis.tightTransitions) lines.push(`⚠️ Solo ${transition.gapMinutes} min tra “${transition.first.title}” e “${transition.second.title}”.`);
+  if (analysis.longestFreeWindow) lines.push(`- Finestra libera più ampia: ${new Date(analysis.longestFreeWindow.start).toLocaleTimeString("it-IT", { timeZone: timezone, hour: "2-digit", minute: "2-digit" })}–${new Date(analysis.longestFreeWindow.end).toLocaleTimeString("it-IT", { timeZone: timezone, hour: "2-digit", minute: "2-digit" })} (${formatAgendaDuration(analysis.longestFreeWindow.minutes)}).`);
+  lines.push("Non ho spostato né modificato nulla.");
+  return { text: lines.join("\n") };
 }
 
 function isCalendarIntent(text: string): boolean {
