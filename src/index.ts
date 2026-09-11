@@ -2601,9 +2601,12 @@ async function createPendingAction(
   params: JsonValue,
 ): Promise<{ id: string; approveData: string; rejectData: string }> {
   const id = crypto.randomUUID();
+  const storedParams = action === "calendar-create" && isRecord(params)
+    ? { ...params, operationId: `calendar_${id.replace(/-/g, "")}` }
+    : params;
   const pending: PendingAction = {
     action,
-    params,
+    params: storedParams,
     chatId,
     createdAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + PENDING_ACTION_TTL * 1000).toISOString(),
@@ -2776,11 +2779,12 @@ const PENDING_ACTION_HANDLERS: Record<PendingActionType, PendingActionHandler> =
     const startAt = asString(params.startAt);
     const endAt = asString(params.endAt);
     const allDay = params.allDay === true;
-    if (!title || !startAt || !endAt) throw new Error("proposta calendario non valida");
+    const operationId = asString(params.operationId);
+    if (!title || !startAt || !endAt || !operationId) throw new Error("proposta calendario non valida");
     const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + "/calendar/create-event";
     const response = await fetch(endpoint, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-agent-key": env.AGENT_KEY },
+      headers: { "content-type": "application/json", "x-agent-key": env.AGENT_KEY, "x-operation-id": operationId },
       body: JSON.stringify({
         title,
         start: allDay ? startAt.slice(0, 10) : startAt,
