@@ -481,9 +481,9 @@ export default {
     if (noteReply) {
       await appendHistory(env, chatId, [
         { role: "user", content: text },
-        { role: "assistant", content: noteReply },
+        { role: "assistant", content: noteReply.text },
       ]);
-      await sendMessage(env, chatId, noteReply);
+      await sendMessage(env, chatId, noteReply.text, noteReply.inlineKeyboard ? { inlineKeyboard: noteReply.inlineKeyboard } : undefined);
       return new Response("ok");
     }
 
@@ -631,7 +631,7 @@ type DeepDiveJob = {
   error: string | null;
 };
 type TelegramInlineButton = { text: string; callback_data: string };
-type PendingActionType = "task-open" | "skill-merge" | "skill-quarantine" | "learning-rule-add" | "learning-rule-delete" | "arretrati-log-event" | "arretrati-suspend" | "arretrati-retry" | "arretrati-audit-tag" | "calendar-create" | "calendar-update" | "calendar-delete";
+type PendingActionType = "task-open" | "skill-merge" | "skill-quarantine" | "learning-rule-add" | "learning-rule-delete" | "arretrati-log-event" | "arretrati-suspend" | "arretrati-retry" | "arretrati-audit-tag" | "calendar-create" | "calendar-update" | "calendar-delete" | "note-delete";
 type PendingAction = {
   action: PendingActionType;
   params: JsonValue;
@@ -2606,7 +2606,7 @@ async function createPendingAction(
   // Ogni scrittura Calendar deve avere lo stesso identificativo anche in caso
   // di retry del callback Telegram: il backend lo usa per non duplicare
   // creazioni, modifiche o cancellazioni.
-  const storedParams = action.startsWith("calendar-") && isRecord(params)
+  const storedParams = (action.startsWith("calendar-") || action === "note-delete") && isRecord(params)
     ? { ...params, operationId: `calendar_${id.replace(/-/g, "")}` }
     : params;
   const pending: PendingAction = {
@@ -2872,6 +2872,23 @@ const PENDING_ACTION_HANDLERS: Record<PendingActionType, PendingActionHandler> =
       throw new Error(`Calendar delete ${response.status}${detail ? `: ${detail}` : ""}`);
     }
     return `Evento cancellato: ${title}.`;
+  },
+  "note-delete": async (env, params) => {
+    const noteId = asString(params.noteId);
+    const title = asString(params.title) ?? "Nota";
+    const operationId = asString(params.operationId);
+    if (!noteId || !operationId) throw new Error("proposta cancellazione nota non valida");
+    const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + "/notes/delete";
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-agent-key": env.AGENT_KEY, "x-operation-id": operationId },
+      body: JSON.stringify({ noteId }),
+    });
+    const body = asRecord(await response.json().catch(() => null));
+    if (!response.ok || body.ok !== true || asString(body.noteId) !== noteId) {
+      throw new Error(`notes/delete ${response.status}`);
+    }
+    return `Nota cancellata e verificata su BlocNotes: ${title}.`;
   },
 };
 
@@ -5254,7 +5271,41 @@ async function gestisciSegna(env: Env, chatId: number, history: Turn[]): Promise
   return `Segno questa:\n\n"${testo}"${cliente ? `\n(${cliente})` : ""}\n\nConfermi?`;
 }
 
-async function gestisciNotaBlocNotes(env: Env, chatId: number, messageId: number, text: string): Promise<string | null> {
+function noteDeletionQuery(text: string): string | null {
+  const match = /^\s*(?:cancella|elimina|rimuovi)\s+(?:la\s+)?nota\s+(.+)$/i.exec(text.trim());
+  return match?.[1]?.trim() || null;
+}
+
+async function gestisciNotaBlocNotes(env: Env, chatId: number, messageId: number, text: string): Promise<CalendarReply | null> {
+  const deleteQuery = noteDeletionQuery(text);
+  if (deleteQuery) {
+    try {
+      const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + "/sources/blocnotes/search";
+      const url = new URL(endpoint);
+      url.searchParams.set("q", deleteQuery);
+      const response = await fetch(url.toString(), { headers: { "x-agent-key": env.AGENT_KEY } });
+      const body = asRecord(await response.json().catch(() => null));
+      const matches = Array.isArray(body.matches) ? body.matches.filter(isRecord) : [];
+      if (!response.ok) return { text: "Non riesco a cercare la nota su BlocNotes: non ho cancellato nulla." };
+      if (!matches.length) return { text: "Non trovo una nota BlocNotes che corrisponda. Non ho cancellato nulla." };
+      if (matches.length > 1) {
+        const choices = matches.slice(0, 5).map(match => `- ${asString(match.title) ?? "Nota senza titolo"}`).join("\n");
+        return { text: `Ho trovato piÃ¹ note. Dimmi quale devo cancellare:\n${choices}\n\nNon ho cancellato nulla.` };
+      }
+      const match = matches[0];
+      const noteId = asString(match.id);
+      const title = asString(match.title) ?? "Nota Telegram";
+      if (!noteId) return { text: "La nota trovata non ha un identificativo valido. Non ho cancellato nulla." };
+      const pending = await createPendingAction(env, chatId, "note-delete", { noteId, title });
+      return {
+        text: `Confermi la cancellazione su BlocNotes?\nNota: ${title}\n\nFinchÃ© non confermi, non cancello nulla.`,
+        inlineKeyboard: [[{ text: "Cancella nota", callback_data: pending.approveData }, { text: "Annulla", callback_data: pending.rejectData }]],
+      };
+    } catch (error) {
+      console.error("[BLOCNOTES] ricerca cancellazione fallita", { chatId, messageId, error: error instanceof Error ? error.message : String(error) });
+      return { text: "Non riesco a verificare la nota su BlocNotes. Non ho cancellato nulla." };
+    }
+  }
   const fact = extractNoteCapture(text);
   if (!fact) return null;
   const endpoint = env.TASK_URL.replace(/\/task\/?$/i, "") + "/notes/capture";
@@ -5268,13 +5319,13 @@ async function gestisciNotaBlocNotes(env: Env, chatId: number, messageId: number
     const body = asRecord(await response.json().catch(() => null));
     if (!response.ok || body.ok !== true || body.outcome !== "saved") {
       console.error("[BLOCNOTES] salvataggio nota fallito", { chatId, messageId, status: response.status, error: asString(body.error) ?? "risposta non valida" });
-      return "Non sono riuscito a salvarla su BlocNotes. Non la considero registrata: riprova tra poco.";
+      return { text: "Non sono riuscito a salvarla su BlocNotes. Non la considero registrata: riprova tra poco." };
     }
     const title = asString(body.title) ?? "Nota Telegram";
-    return `Salvato e verificato su BlocNotes: ${title}.`;
+    return { text: `Salvato e verificato su BlocNotes: ${title}.` };
   } catch (error) {
     console.error("[BLOCNOTES] errore salvataggio nota", { chatId, messageId, error: error instanceof Error ? error.message : String(error) });
-    return "Non sono riuscito a salvarla su BlocNotes. Non la considero registrata: riprova tra poco.";
+    return { text: "Non sono riuscito a salvarla su BlocNotes. Non la considero registrata: riprova tra poco." };
   }
 }
 
