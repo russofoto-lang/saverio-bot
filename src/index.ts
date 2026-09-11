@@ -170,6 +170,8 @@ Se Mariano ti fa una domanda che non c'entra con l'agenzia (curiosità, attualit
 - Puoi proporre la creazione, la modifica o la cancellazione di un evento. Non puoi mai applicare una di queste operazioni automaticamente: prima Mariano deve ricevere e confermare esplicitamente il riepilogo con il relativo pulsante.
 - Se una formulazione non attiva il comando Calendar in quel turno, non negare la capacità: spiega in modo naturale che puoi controllare l'agenda o preparare una proposta di evento da confermare.
 
+Regola non negoziabile: non dichiarare mai creata, modificata o cancellata un'operazione Calendar senza l'esito verificato del sistema. Se una richiesta e' ambigua, di' che non hai eseguito nulla.
+
 ## Concorrenti e mercato locale
 Quando Mariano chiede di monitorare i concorrenti, cerchi su web fotografi e agenzie creative attivi nell'area: Foggia, Cerignola, Manfredonia, San Severo, Lucera, Trinitapoli, Barletta. Cerca per categoria: "fotografo matrimonio [città]", "agenzia social [città]", "fotografo eventi [città]", "agenzia creativa [città]", "video maker [città]".
 Riporta chi ha sito attivo, social aggiornati, offerta, posizionamento. Non inventare dati — se non trovi niente su uno, lo dici.
@@ -3758,6 +3760,27 @@ const checkinStateKey = (chatId: number) => `daily_checkin_state:${chatId}`;
 const checkinRescheduleKey = (chatId: number) => `daily_checkin_reschedule:${chatId}`;
 const calendarReadContextKey = (chatId: number) => `calendar_read_context:${chatId}`;
 const calendarOperationStatusKey = (chatId: number) => `calendar_operation_status:${chatId}`;
+const calendarOperationContextKey = (chatId: number) => `calendar_operation_context:${chatId}`;
+
+async function hasRecentCalendarOperationContext(env: Env, chatId: number): Promise<boolean> {
+  return Boolean(await env.SAVERIO_KV.get(calendarOperationContextKey(chatId)));
+}
+
+async function saveCalendarOperationContext(env: Env, chatId: number, action: "create" | "mutate" | "read"): Promise<void> {
+  await env.SAVERIO_KV.put(
+    calendarOperationContextKey(chatId),
+    JSON.stringify({ source: "calendar", action, at: new Date().toISOString() }),
+    { expirationTtl: 12 * 60 * 60 },
+  );
+}
+
+function isBareDatedCalendarMutation(text: string): boolean {
+  const value = normalizeForMatch(text);
+  const action = /^(?:sposta|modifica|cambia|aggiorna|rinomina|cancella|elimina|rimuovi)\b/.test(value);
+  const date = /\b(?:oggi|domani|dopodomani)\b/.test(value) || /\b(?:[1-9]|[12]\d|3[01])\s+(?:gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)\b/.test(value);
+  const excludedSource = /\b(?:task|nota|blocco notes|promemoria)\b/.test(value);
+  return action && date && !excludedSource;
+}
 
 async function loadCalendarReadContext(env: Env, chatId: number): Promise<CalendarReadRange[] | null> {
   const raw = await env.SAVERIO_KV.get(calendarReadContextKey(chatId));
@@ -3945,17 +3968,30 @@ function isCalendarReadIntent(text: string): boolean {
 
 async function gestisciCalendar(env: Env, chatId: number, text: string): Promise<CalendarReply | null> {
   const timezone = env.TIMEZONE || "Europe/Rome";
-  const operation = interpretCalendarOperation(text, timezone, await loadCalendarReadContext(env, chatId));
+  let operation = interpretCalendarOperation(text, timezone, await loadCalendarReadContext(env, chatId));
+  // Una data relativa e un verbo operativo identificano un evento anche senza
+  // ripetere "Calendar"; il contesto copre le continuazioni tra messaggi.
+  if (operation.kind === "none" && (isBareDatedCalendarMutation(text) || await hasRecentCalendarOperationContext(env, chatId))) {
+    const value = normalizeForMatch(text);
+    if (/^(?:sposta|modifica|cambia|aggiorna|rinomina|cancella|elimina|rimuovi)\b/.test(value)) operation = { kind: "mutate" };
+  }
   if (operation.kind === "capability") return { text: "Sì, posso leggere il tuo Google Calendar e cercare gli impegni per data o periodo." };
   if (operation.kind === "status") return getCalendarOperationStatus(env, chatId);
   if (operation.kind === "none") return null;
-  if (operation.kind === "mutate") return gestisciMutazioneCalendar(env, chatId, text);
-  if (operation.kind === "create") return gestisciCreazioneCalendar(env, chatId, text);
+  if (operation.kind === "mutate") {
+    await saveCalendarOperationContext(env, chatId, "mutate");
+    return gestisciMutazioneCalendar(env, chatId, text);
+  }
+  if (operation.kind === "create") {
+    await saveCalendarOperationContext(env, chatId, "create");
+    return gestisciCreazioneCalendar(env, chatId, text);
+  }
   const readPlan = operation.plan;
   if (readPlan.kind === "invalid_period") return { text: "La data indicata non esiste. Dimmi una data valida e la cerco in Calendar." };
   if (readPlan.kind === "needs_period") return { text: "Dimmi per quale giorno o periodo devo controllare Calendar." };
   if (readPlan.kind === "read") {
     await env.SAVERIO_KV.put(calendarReadContextKey(chatId), JSON.stringify(readPlan.ranges), { expirationTtl: 12 * 60 * 60 });
+    await saveCalendarOperationContext(env, chatId, "read");
     const results = await Promise.all(readPlan.ranges.map(async (range) => ({ range, events: await listGoogleCalendarEvents(env, range.start, range.end) })));
     if (results.some((result) => result.events === null)) return { text: "Non riesco a leggere Google Calendar in questo momento. Riprova tra poco." };
     const rules = readPlan.filter === "work" ? await loadLearnedRules(env, chatId) : [];
