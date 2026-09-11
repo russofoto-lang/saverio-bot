@@ -5303,7 +5303,7 @@ async function gestisciNotaBlocNotes(env: Env, chatId: number, messageId: number
       if (recent && matchesNoteText(deleteQuery, recent.fact)) {
         const pending = await createPendingAction(env, chatId, "note-delete", { noteId: recent.noteId, title: recent.title });
         return {
-          text: `Confermi la cancellazione su BlocNotes?\nNota: ${recent.title}\n\nFinchÃ© non confermi, non cancello nulla.`,
+          text: `Confermi la cancellazione su BlocNotes?\nNota: ${recent.title}\n\nFino alla conferma, non cancello nulla.`,
           inlineKeyboard: [[{ text: "Cancella nota", callback_data: pending.approveData }, { text: "Annulla", callback_data: pending.rejectData }]],
         };
       }
@@ -5329,7 +5329,7 @@ async function gestisciNotaBlocNotes(env: Env, chatId: number, messageId: number
       if (!noteId) return { text: "La nota trovata non ha un identificativo valido. Non ho cancellato nulla." };
       const pending = await createPendingAction(env, chatId, "note-delete", { noteId, title });
       return {
-        text: `Confermi la cancellazione su BlocNotes?\nNota: ${title}\n\nFinchÃ© non confermi, non cancello nulla.`,
+        text: `Confermi la cancellazione su BlocNotes?\nNota: ${title}\n\nFino alla conferma, non cancello nulla.`,
         inlineKeyboard: [[{ text: "Cancella nota", callback_data: pending.approveData }, { text: "Annulla", callback_data: pending.rejectData }]],
       };
     } catch (error) {
